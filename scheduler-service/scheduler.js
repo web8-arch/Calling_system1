@@ -14,7 +14,10 @@ export class Scheduler {
         console.log('🚀 [Scheduler] Starting contact scanning loop...');
         const db = await getDb();
 
-        // 0. Activate scheduled campaigns whose time has arrived
+        // 0a. Activate immediateStart campaigns once their script is ready
+        await this.activateImmediateStartCampaigns(db);
+
+        // 0b. Activate scheduled campaigns whose time has arrived
         await this.activateScheduledCampaigns(db);
 
         // 1. Find active campaigns
@@ -27,6 +30,81 @@ export class Scheduler {
 
         for (const campaign of activeCampaigns) {
             await this.processCampaign(campaign, db);
+        }
+    }
+
+    /**
+     * Handles campaigns created with immediateStart: true.
+     * Instead of waiting for startTime, we poll the campaignscripts collection
+     * every scheduler loop (~30s). The moment a script is found, the campaign
+     * is validated and activated immediately.
+     */
+    async activateImmediateStartCampaigns(db) {
+        // Find all immediateStart campaigns that are still waiting to be activated
+        const pendingCampaigns = await db.collection('campaigns').find({
+            immediateStart: true,
+            status: { $nin: ['active', 'completed', 'paused', 'failed'] },
+            archive: { $ne: true }
+        }).toArray();
+
+        if (pendingCampaigns.length === 0) return;
+
+        console.log(`⚡ [Scheduler] Checking ${pendingCampaigns.length} immediateStart campaign(s) for script readiness...`);
+
+        for (const campaign of pendingCampaigns) {
+            const campaignId = campaign._id;
+
+            // Check if the campaign script has been generated yet
+            const script = await db.collection('campaign_scripts').findOne({
+                $or: [
+                    { campaignId: campaignId },
+                    { campaignId: campaignId.toString() }
+                ]
+            });
+
+            if (!script) {
+                console.log(`⏳ [Scheduler] Script not ready yet for immediateStart campaign: ${campaign.campaignName} (${campaignId}). Will retry next loop.`);
+                continue;
+            }
+
+            console.log(`✅ [Scheduler] Script found for campaign: ${campaign.campaignName} (${campaignId}). Proceeding to activate...`);
+
+            // Validate required fields (startDate/startTime not required for immediateStart)
+            const { isValid, missingFields } = this.validateCampaignConfig(campaign);
+            if (!isValid) {
+                console.warn(`[Scheduler] immediateStart campaign ${campaign.campaignName} (${campaignId}) missing fields: ${missingFields.join(', ')}`);
+                await db.collection('campaigns').updateOne(
+                    { _id: campaignId },
+                    {
+                        $set: {
+                            status: 'draft',
+                            error: `Missing required fields: ${missingFields.join(', ')}`,
+                            updatedAt: new Date()
+                        }
+                    }
+                );
+                continue;
+            }
+
+            // Check contacts exist
+            const contactExists = await db.collection('contactprocessings').findOne({ campaignId });
+            if (!contactExists) {
+                console.warn(`[Scheduler] immediateStart campaign ${campaign.campaignName} (${campaignId}) has no contacts. Skipping activation.`);
+                continue;
+            }
+
+            // Activate!
+            await db.collection('campaigns').updateOne(
+                { _id: campaignId },
+                {
+                    $set: {
+                        status: 'active',
+                        activatedAt: new Date(),
+                        updatedAt: new Date()
+                    }
+                }
+            );
+            console.log(`🚀 [Scheduler] immediateStart campaign ACTIVATED: ${campaign.campaignName} (${campaignId})`);
         }
     }
 
@@ -93,9 +171,12 @@ export class Scheduler {
      * Validates that all required fields for a campaign are present.
      */
     validateCampaignConfig(campaign) {
+        // immediateStart campaigns don't need startDate/startTime — they activate on script readiness
         const requiredFields = [
-            { field: 'startDate', label: 'Start Date' },
-            { field: 'startTime', label: 'Start Time' },
+            ...(!campaign.immediateStart ? [
+                { field: 'startDate', label: 'Start Date' },
+                { field: 'startTime', label: 'Start Time' }
+            ] : []),
             { field: 'concurrentCalls', label: 'Concurrent Calls' },
             { field: 'createdBy', label: 'Created By' },
             { field: 'agentName', label: 'Agent Name' },
@@ -131,6 +212,39 @@ export class Scheduler {
 
         console.log(`📡 [Scheduler] Processing campaign: ${campaign.campaignName} (${campaign._id})`);
 
+        // Fetch the user's purchased concurrent call limit from the DB
+        // The limit is stored per-phone-number in user.phoneNumbers[].concurrentCalls
+        const campaignUser = await db.collection('users').findOne(
+            { email: campaign.createdBy },
+            { projection: { phoneNumbers: 1 } }
+        );
+
+        // Find the phone number entry that matches this campaign's selected phone
+        // campaign.phoneNumberId or campaign.phoneNumber references the purchased number
+        const campaignPhoneRef = campaign.phoneNumberId || campaign.phoneNumber || campaign.fromNumber;
+        let userConcurrentLimit = 10; // safe default
+
+        if (campaignUser?.phoneNumbers && Array.isArray(campaignUser.phoneNumbers)) {
+            const matchedPhone = campaignUser.phoneNumbers.find(p =>
+                p.id === campaignPhoneRef ||
+                p.number === campaignPhoneRef ||
+                p._id?.toString() === campaignPhoneRef?.toString()
+            );
+
+            if (matchedPhone?.concurrentCalls) {
+                userConcurrentLimit = matchedPhone.concurrentCalls;
+                console.log(`📞 [Scheduler] Phone ${matchedPhone.number} has concurrentCalls limit: ${userConcurrentLimit}`);
+            } else {
+                // Fallback: sum all phone concurrentCalls for this user (if no phoneRef on campaign)
+                const totalLimit = campaignUser.phoneNumbers.reduce((sum, p) => sum + (p.concurrentCalls || 0), 0);
+                userConcurrentLimit = totalLimit || campaign.concurrentCalls || 10;
+                console.log(`� [Scheduler] No phone match found. Using total/fallback limit: ${userConcurrentLimit}`);
+            }
+        } else {
+            userConcurrentLimit = campaign.concurrentCalls || 10;
+            console.log(`📞 [Scheduler] No phoneNumbers on user. Falling back to campaign limit: ${userConcurrentLimit}`);
+        }
+
         const now = new Date();
         const contactCursor = db.collection('contactprocessings').find({
             campaignId: campaign._id,
@@ -159,7 +273,7 @@ export class Scheduler {
                     metadata: {
                         businessHours: campaign.callingHours || campaign.businessHours,
                         campaignLimit: campaign.concurrentCalls || 500,
-                        userLimit: 100, // Example user-level limit
+                        userLimit: userConcurrentLimit, // ← user's actual purchased limit (cross-campaign total)
                         maxRetryAttempts: campaign.maxRetryAttempts || 3,
                         retryDelayMinutes: campaign.retryDelayMinutes || 30,
                         voiceTier: campaign.selectedVoice?.tier || 'premium'

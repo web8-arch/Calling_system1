@@ -14,7 +14,7 @@ async function main() {
             console.error('Fatal error in scheduler loop:', err);
         } finally {
             console.log('Waiting for next scan...');
-            setTimeout(runLoop, 60000); // Scan every minute
+            setTimeout(runLoop, 30000); // Scan every 30s — fast enough for immediateStart script polling
         }
     };
 
