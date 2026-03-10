@@ -127,7 +127,7 @@ export class CallWorker {
 
             // 6. Polling Logic: Wait for the API to register the call (Status 1, 2, or 3)
             console.log(`⏳ [Worker] Waiting for call registration for ${contactId}...`);
-            let updatedContact = await this.pollStatus(contactId, [1, 2, 3], 30000, 1000); // 30s timeout
+            let updatedContact = await this.pollStatus(contactId, [1, 2, 3], 120000, 1000); // Increased to 120s timeout for high concurrency
             let callStatus = parseInt(updatedContact?.callReceiveStatus) || 0;
 
             // 7. State-Based Slot Management
@@ -139,7 +139,7 @@ export class CallWorker {
                 shouldReleaseSlot = false;
 
                 // Wait for status to become 2 (Running) or 3 (Completed)
-                updatedContact = await this.pollStatus(contactId, [2, 3], 60000, 2000);
+                updatedContact = await this.pollStatus(contactId, [2, 3], 180000, 2000); // Increased to 180s for carrier/webhook delays
                 callStatus = parseInt(updatedContact?.callReceiveStatus) || 0;
 
                 if (callStatus === 2) {
@@ -156,16 +156,29 @@ export class CallWorker {
                                 console.log(`📡 [Worker] Campaign stopped. Dropping contact ${contactId}.`);
                                 return;
                             }
+
+                            // Check if call completed while waiting for the slot (prevents job from stalling)
+                            const checkContact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
+                            const checkStatus = parseInt(checkContact?.callReceiveStatus) || 0;
+                            if (checkStatus === 3 || checkStatus === 0) {
+                                console.log(`📡 [Worker] Call ${contactId} status became ${checkStatus} while waiting for slot! Breaking re-acquire loop.`);
+                                callStatus = checkStatus;
+                                break;
+                            }
+
                             await new Promise(resolve => setTimeout(resolve, 2000));
                         }
                     }
-                    currentlyHoldingSlot = true;
-                    shouldReleaseSlot = true;
 
-                    // Now wait for completion
-                    console.log(`📡 [Worker] Slot held for ${contactId}. Waiting for completion...`);
-                    updatedContact = await this.pollStatus(contactId, [3], 600000, 2000);
-                    callStatus = parseInt(updatedContact?.callReceiveStatus) || 0;
+                    if (reAcquired) {
+                        currentlyHoldingSlot = true;
+                        shouldReleaseSlot = true;
+
+                        // Now wait for completion
+                        console.log(`📡 [Worker] Slot held for ${contactId}. Waiting for completion...`);
+                        updatedContact = await this.pollStatus(contactId, [3], 600000, 2000);
+                        callStatus = parseInt(updatedContact?.callReceiveStatus) || 0;
+                    }
                 }
             } else if (callStatus === 2) {
                 // RUNNING immediately: Keep the slot and wait for completion
@@ -312,15 +325,25 @@ export class CallWorker {
             }
         }
     }
-
     async executeCall(data) {
-        const url = 'http://72.60.221.48:8000/api/v1/calls/initiate-campaign-call';
+        const db = await getDb();
+        const campaign = await db.collection('campaigns').findOne({ _id: new ObjectId(data.campaignId) });
+
+        const tier = campaign?.selectedVoice?.tier || 'premium';
+
+        let url;
+        if (tier === 'basic') {
+            url = process.env.CALL_API_BASIC_URL || 'http://72.60.221.48:8000/api/v1/calls/initiate-campaign-call';
+        } else {
+            url = process.env.CALL_API_PREMIUM_URL || 'http://72.60.221.48:8000/api/v1/calls/initiate-campaign-call';
+        }
+
         const payload = {
             campaign_id: data.campaignId,
             contact_id: data.contactId
         };
 
-        console.log(`📞 [Worker] Making call to ${data.phone} via API...`);
+        console.log(`📞 [Worker] Making ${tier} call to ${data.phone || data.contactId} via API (${url})...`);
 
         const response = await fetch(url, {
             method: 'POST',
@@ -383,8 +406,6 @@ export class CallWorker {
         let duration = 0;
         let callId = apiResponse.call?.id || apiResponse.call_id || apiResponse.id || apiResponse.callId;
 
-        console.log("Call Id ::::::::::", callId);
-
         try {
             // 1.1 Use a short polling loop to wait for the webhook to create the CallLog
             // This fixes the race condition where triggerPostCallActions starts before the webhook finishes.
@@ -394,13 +415,23 @@ export class CallWorker {
             const pollStart = Date.now();
 
             while (Date.now() - pollStart < maxPollTime) {
-                callLog = await db.collection("CallLogs").findOne({
-                    $or: [
-                        { call_id: callId },
-                        { contact_id: contactId },
-                        { contact_id: new ObjectId(contactId) }
-                    ]
-                });
+                // Prioritize search by call_id if available, otherwise try contact_id
+                if (callId && !callId.startsWith('call_')) {
+                    callLog = await db.collection("CallLogs").findOne({ call_id: callId });
+                }
+
+                if (!callLog) {
+                    // Fallback to contact_id but get the MOST RECENT one
+                    callLog = await db.collection("CallLogs").findOne(
+                        {
+                            $or: [
+                                { contact_id: contactId },
+                                { contact_id: new ObjectId(contactId) }
+                            ]
+                        },
+                        { sort: { createdAt: -1 } }
+                    );
+                }
 
                 if (callLog) break;
 
@@ -412,16 +443,37 @@ export class CallWorker {
                 await new Promise(resolve => setTimeout(resolve, pollInterval));
             }
 
-            console.log("CallLog found/timeout ::::::", callLog ? "FOUND" : "NULL");
-
             if (callLog) {
                 callId = callLog.call_id || callId;
-                const completedEvent = callLog.call_data?.events?.find(e => e.event_type === 'call.completed');
-                duration = completedEvent?.data?.data?.duration || 0;
-                console.log(`📄 [Worker] Found CallLog for ${contactId}. Verified Duration: ${duration}ms, CallID: ${callId}`);
+                const events = callLog.call_data?.events || [];
+                const cdrPush = events.find(e => e.event_type === 'cdr_push');
+
+                // 1.2 Determine status and duration from events
+                if (cdrPush?.data?.CallStatus === 'ANSWER') {
+                    const hangup = events.find(e => e.event_type === 'call_hangup');
+                    const answered = events.find(e => e.event_type === 'call_answered');
+
+                    if (hangup?.data?.end_time && answered?.data?.answer_time) {
+                        try {
+                            const end = new Date(hangup.data.end_time);
+                            const start = new Date(answered.data.answer_time);
+                            duration = Math.max(0, Math.floor((end - start) / 1000)); // Seconds
+                            console.log(`📄 [Worker] Calculated talking duration from events: ${duration}s`);
+                        } catch (calcError) {
+                            duration = parseInt(cdrPush.data.Duration) || 0;
+                            console.warn(`⚠️ [Worker] Error calculating duration from timestamps, using fallback Duration: ${duration}s`);
+                        }
+                    } else {
+                        duration = parseInt(cdrPush.data.Duration) || 0;
+                        console.log(`📄 [Worker] Using fallback Duration from cdr_push: ${duration}s`);
+                    }
+                } else {
+                    console.log(`📄 [Worker] Call not answered (Status: ${cdrPush?.data?.CallStatus || 'UNKNOWN'}). Setting duration to 0.`);
+                    duration = 0;
+                }
             } else {
                 console.warn(`⚠️ [Worker] No CallLog found for ${contactId} after 20s wait. Falling back to API response duration.`);
-                duration = apiResponse.call?.duration || apiResponse.duration || 0;
+                duration = (apiResponse.call?.duration || apiResponse.duration || 0) / 1000; // API usually returns ms, convert to s
             }
         } catch (logError) {
             console.error(`❌ [Worker] Error fetching CallLog:`, logError.message);
@@ -477,7 +529,7 @@ export class CallWorker {
                 } else {
                     // Global Fallbacks if package is missing
                     const fallbackPremium = { 'A': 0.08, 'B': 0.075, 'C': 0.07, 'D': 0.065 };
-                    const fallbackBasic = { 'A': 0.05, 'B': 0.045, 'C': 0.04, 'D': 0.035 };
+                    const fallbackBasic = { 'A': 0.055, 'B': 0.05, 'C': 0.045, 'D': 0.04 };
 
                     ratePerMinute = isBasicVoice ?
                         (fallbackBasic[currentTier] || 0.05) :
@@ -491,9 +543,9 @@ export class CallWorker {
             }
 
             // 3. Billing Brackets and Cost Calculation
-            const durationInSeconds = duration / 1000;
+            const durationInSeconds = duration; // Already in seconds from logic above
 
-            console.log("duratiion seconds :::::::", durationInSeconds)
+            console.log("duration seconds :::::::", durationInSeconds)
             const fullMinutes = Math.floor(durationInSeconds / 60);
             const remainingSeconds = durationInSeconds % 60;
 
@@ -558,7 +610,7 @@ export class CallWorker {
                 type: 'call_deduction',
                 amount: -cost,
                 balanceAfter: parseFloat(((user.credits || 0) - cost).toFixed(6)),
-                description: `Call Usage - ${Math.round(durationInSeconds)}s (${(durationInSeconds / 60).toFixed(2)}m)`,
+                description: `Call Usage`,
                 reference: {
                     campaignId: campaign._id,
                     campaignName: campaign.name || campaign.campaignName,
