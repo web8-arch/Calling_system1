@@ -78,6 +78,71 @@ function parseEndTimeParts(endTime) {
     return null;
 }
 
+/** Maps Undici / system codes from a failed Call API fetch to operator-friendly messages (no extra I/O). */
+const CALL_API_FETCH_MESSAGES = {
+    // Node libuv / system
+    ECONNREFUSED: 'API connection refused (nothing listening on host/port or service down)',
+    ETIMEDOUT: 'API connection timed out',
+    ENOTFOUND: 'API host could not be resolved (DNS)',
+    EAI_AGAIN: 'API host lookup failed temporarily (DNS)',
+    ECONNRESET: 'API closed the connection unexpectedly',
+    EPIPE: 'API connection broken while sending request',
+    ENETUNREACH: 'Network unreachable (cannot route to API host)',
+    EHOSTUNREACH: 'API host unreachable',
+    EADDRINUSE: 'Local address in use (outbound socket conflict)',
+    CERT_HAS_EXPIRED: 'API TLS certificate expired',
+    UNABLE_TO_VERIFY_LEAF_SIGNATURE: 'API TLS certificate could not be verified',
+    // Undici (Node fetch)
+    UND_ERR_CONNECT_TIMEOUT: 'API connection timed out (connect phase)',
+    UND_ERR_HEADERS_TIMEOUT: 'API response headers timed out',
+    UND_ERR_BODY_TIMEOUT: 'API response body timed out',
+    UND_ERR_SOCKET: 'API socket error',
+    UND_ERR_ABORTED: 'API request aborted',
+    UND_ERR_NOT_SUPPORTED: 'API request not supported'
+};
+
+/**
+ * Best-effort errno / Undici code from fetch failure (nested cause / AggregateError).
+ */
+function extractNodeErrnoCode(err, depth = 0) {
+    if (!err || depth > 10) return undefined;
+
+    const code = err.code;
+    if (typeof code === 'string' && code.length > 0) {
+        if (code.startsWith('E') && code.length >= 4) return code;
+        if (code.startsWith('UND_ERR')) return code;
+    }
+
+    if (err.cause) {
+        const fromCause = extractNodeErrnoCode(err.cause, depth + 1);
+        if (fromCause) return fromCause;
+    }
+    if (Array.isArray(err.errors)) {
+        for (const e of err.errors) {
+            const c = extractNodeErrnoCode(e, depth + 1);
+            if (c) return c;
+        }
+    }
+    return undefined;
+}
+
+/**
+ * User- and DB-friendly message for transport-level fetch failures to the Call API.
+ */
+function messageForCallApiFetchFailure(err) {
+    const code = extractNodeErrnoCode(err);
+    if (code && CALL_API_FETCH_MESSAGES[code]) return CALL_API_FETCH_MESSAGES[code];
+    if (code) return `Call API request failed (${code})`;
+
+    const causeMsg = err?.cause && typeof err.cause.message === 'string' ? err.cause.message.trim() : '';
+    if (causeMsg) return `Call API error: ${causeMsg}`;
+
+    const top = typeof err?.message === 'string' ? err.message.trim() : '';
+    if (top && top !== 'fetch failed') return `Call API error: ${top}`;
+
+    return 'Call API request failed (network error)';
+}
+
 function getCampaignEndDateTime(campaign) {
     if (!campaign) return null;
     const zone = resolveCampaignZone(campaign.timezone);
@@ -595,7 +660,10 @@ export class CallWorker {
                 severity: 'error',
                 errorMessage: error.message,
                 errorStack: error.stack,
-                errorCode: String(error.message || '').includes('fetch failed') ? 'FETCH_FAILED' : undefined,
+                errorCode:
+                    extractNodeErrnoCode(error) ||
+                    (String(error.message || '').startsWith('API_CALL_FAILED:') ? 'API_HTTP_ERROR' : undefined) ||
+                    (/^(API connection|Call API)/.test(String(error.message || '')) ? 'CALL_API_TRANSPORT' : undefined),
                 userId: userId,
                 userEmail: campaignForError?.createdBy,
                 campaignId,
@@ -638,14 +706,24 @@ export class CallWorker {
 
         console.log(`📞 [Worker] Making ${tier} call to ${data.phone || data.contactId} via API (${url})...`);
 
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-API-Key': config.api.callingKey
-            },
-            body: JSON.stringify(payload)
-        });
+        let response;
+        try {
+            response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-API-Key': config.api.callingKey
+                },
+                body: JSON.stringify(payload)
+            });
+        } catch (fetchErr) {
+            const code = extractNodeErrnoCode(fetchErr);
+            const msg = messageForCallApiFetchFailure(fetchErr);
+            console.warn(
+                `⚠️ [Worker] Call API fetch failed${code ? ` [${code}]` : ''}: ${fetchErr?.cause?.message || fetchErr?.message || fetchErr}`
+            );
+            throw new Error(msg, { cause: fetchErr });
+        }
 
         if (!response.ok) {
             const errorText = await response.text();
