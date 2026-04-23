@@ -2,6 +2,7 @@ import { Worker } from 'bullmq';
 import {
     getRedis,
     getDb,
+    getMongoClient,
     concurrencyGuard,
     isWithinBusinessHours,
     isCampaignBlockedByTestCall,
@@ -21,6 +22,7 @@ const ANALYSIS_API_INITIAL_DELAY_MS = parseInt(process.env.ANALYSIS_API_INITIAL_
 const CALL_CREDIT_MAX_ATTEMPTS = parseInt(process.env.CALL_CREDIT_MAX_ATTEMPTS || '5', 10);
 const CALL_CREDIT_RETRY_MS = parseInt(process.env.CALL_CREDIT_RETRY_MS || '3000', 10);
 const CALL_COMPLETION_CONFIRM_MS = parseInt(process.env.CALL_COMPLETION_CONFIRM_MS || '6000', 10);
+const BILLING_HEALTH_LOG_INTERVAL_MS = parseInt(process.env.BILLING_HEALTH_LOG_INTERVAL_MS || '300000', 10);
 
 /**
  * Billable duration (seconds) from CallLog events. Prefers call_answered + call_hangup timestamps, then cdr_push.Duration when ANSWER.
@@ -192,6 +194,19 @@ async function shouldIgnoreEndWindow({ campaign, metadata, db }) {
 export class CallWorker {
     constructor() {
         this.postCallQueue = createPostCallQueue();
+        this.billingIndexesEnsured = false;
+        this.billingHealth = {
+            deductedCalls: 0,
+            deductedAmount: 0,
+            alreadyBilledSkips: 0,
+            insufficientCreditSkips: 0,
+            missingIdentitySkips: 0,
+            transactionUnavailableSkips: 0,
+            transactionErrors: 0,
+        };
+        this.billingHealthTimer = setInterval(() => {
+            this.logBillingHealthSummaryAndReset();
+        }, BILLING_HEALTH_LOG_INTERVAL_MS);
 
         this.worker = new Worker(queueName, this.processJob.bind(this), {
             connection: getRedis(),
@@ -267,11 +282,89 @@ export class CallWorker {
     }
 
     async close() {
+        if (this.billingHealthTimer) {
+            clearInterval(this.billingHealthTimer);
+            this.billingHealthTimer = null;
+        }
         await Promise.all([
             this.worker.close(),
             this.postCallWorker.close(),
             this.postCallQueue.close()
         ]);
+    }
+
+    async ensureBillingIndexes(db) {
+        if (this.billingIndexesEnsured) return;
+        await db.collection('credittransactions').createIndex(
+            { type: 1, 'reference.billingKey': 1 },
+            {
+                unique: true,
+                partialFilterExpression: {
+                    type: 'call_deduction',
+                    'reference.billingKey': { $exists: true, $type: 'string' }
+                },
+                background: true
+            }
+        );
+        this.billingIndexesEnsured = true;
+    }
+
+    async verifyBillingReadiness() {
+        try {
+            const db = await getDb();
+            await this.ensureBillingIndexes(db);
+
+            const indexes = await db.collection('credittransactions').indexes();
+            const hasBillingKeyIndex = indexes.some((idx) => {
+                const key = idx?.key || {};
+                return key.type === 1 && key['reference.billingKey'] === 1 && idx.unique === true;
+            });
+            if (hasBillingKeyIndex) {
+                console.log('✅ [Worker] Billing idempotency index ready (credittransactions.type + reference.billingKey unique)');
+            } else {
+                console.error('❌ [Worker] Billing idempotency index missing. Duplicate deductions risk is high.');
+            }
+
+            const mongoClient = await getMongoClient();
+            const hello = await mongoClient.db().admin().command({ hello: 1 });
+            const supportsTransactions = Boolean(hello?.setName || hello?.msg === 'isdbgrid');
+            if (!supportsTransactions) {
+                console.warn(
+                    '⚠️ [Worker] MongoDB is neither replica-set nor mongos. Billing transactions may be unavailable; deduction will fail-safe.'
+                );
+            } else {
+                const topo = hello?.setName ? `replica set ${hello.setName}` : 'mongos cluster';
+                console.log(`✅ [Worker] Mongo topology supports transactions (${topo})`);
+            }
+        } catch (err) {
+            console.error(`❌ [Worker] Billing readiness check failed: ${err?.message || err}`);
+        }
+    }
+
+    logBillingHealthSummaryAndReset() {
+        const s = this.billingHealth;
+        const touched = Object.values(s).some((v) => Number(v) > 0);
+        if (touched) {
+            console.log(
+                `📊 [Worker] Billing health (last ${Math.round(BILLING_HEALTH_LOG_INTERVAL_MS / 60000)}m): ` +
+                `deductedCalls=${s.deductedCalls}, ` +
+                `deductedAmount=${s.deductedAmount.toFixed(6)}, ` +
+                `alreadyBilledSkips=${s.alreadyBilledSkips}, ` +
+                `insufficientCreditSkips=${s.insufficientCreditSkips}, ` +
+                `missingIdentitySkips=${s.missingIdentitySkips}, ` +
+                `transactionUnavailableSkips=${s.transactionUnavailableSkips}, ` +
+                `transactionErrors=${s.transactionErrors}`
+            );
+        }
+        this.billingHealth = {
+            deductedCalls: 0,
+            deductedAmount: 0,
+            alreadyBilledSkips: 0,
+            insufficientCreditSkips: 0,
+            missingIdentitySkips: 0,
+            transactionUnavailableSkips: 0,
+            transactionErrors: 0,
+        };
     }
 
     /**
@@ -1059,27 +1152,6 @@ export class CallWorker {
             `💰 [Worker] Processing credit deduction for Call ID: ${callId}, Lead ID: ${leadId ?? 'N/A'} (Duration: ${duration}s, billing attempts: ${billingAttemptsUsed}/${CALL_CREDIT_MAX_ATTEMPTS})...`
         );
 
-        // Idempotency: BullMQ retries must not double-deduct for same lead_id/call_id
-        if (leadId != null || (callId && !String(callId).startsWith('call_'))) {
-            const dedupeOr = [];
-            if (leadId != null) {
-                dedupeOr.push({ 'reference.leadId': leadId });
-                dedupeOr.push({ 'reference.leadId': String(leadId) });
-            }
-            if (callId && !String(callId).startsWith('call_')) {
-                dedupeOr.push({ 'reference.callId': callId });
-                dedupeOr.push({ 'reference.callId': String(callId) });
-            }
-            const alreadyBilled = await db.collection('credittransactions').findOne({
-                type: 'call_deduction',
-                $or: dedupeOr
-            });
-            if (alreadyBilled) {
-                console.log(`ℹ️ [Worker] Credit already recorded for call ${callId} / lead ${leadId ?? 'N/A'}, skipping duplicate post-call billing.`);
-                return;
-            }
-        }
-
         try {
             // 1. Fetch Campaign and User
             const campaign = await db.collection('campaigns').findOne({ _id: new ObjectId(campaignId) });
@@ -1137,6 +1209,35 @@ export class CallWorker {
                 ratePerMinute = 0.08;
             }
 
+            const stableCallId =
+                callId && !String(callId).startsWith('call_')
+                    ? String(callId)
+                    : null;
+            const stableLeadId = leadId != null ? String(leadId) : null;
+            const billingKey = stableCallId
+                ? `${String(campaign._id)}:call:${stableCallId}`
+                : stableLeadId
+                    ? `${String(campaign._id)}:lead:${stableLeadId}`
+                    : null;
+            if (!billingKey) {
+                console.warn(`⚠️ [Worker] Missing stable billing identity for contact ${contactId}. Skipping deduction to prevent duplicate billing risk.`);
+                this.billingHealth.missingIdentitySkips += 1;
+                if (callLogUpdateFilter) {
+                    await db.collection('CallLogs').updateOne(
+                        callLogUpdateFilter,
+                        {
+                            $set: {
+                                creditsDeducted: false,
+                                creditDeductionError: 'missing_billing_identity',
+                                processedAt: new Date(),
+                                updatedAt: new Date()
+                            }
+                        }
+                    );
+                }
+                return;
+            }
+
             // 3. Billing Brackets and Cost Calculation
             const durationInSeconds = duration; // Already in seconds from logic above
 
@@ -1164,10 +1265,152 @@ export class CallWorker {
             }
 
             const cost = parseFloat(((fullMinutes * ratePerMinute) + (partialMinuteFraction * ratePerMinute)).toFixed(6));
+            const creditTxCol = db.collection('credittransactions');
+            await this.ensureBillingIndexes(db);
 
-            // 4. Atomic Credit Deduction
-            if (user.credits < cost) {
-                console.warn(`⚠️ [Worker] Insufficient credits for ${user.email}. Cost: ${cost}, Balance: ${user.credits}`);
+            let alreadyBilled = false;
+            let insufficientCredits = false;
+            let callLogMatchedInTx = null;
+            const mongoClient = await getMongoClient();
+            const session = mongoClient.startSession();
+
+            try {
+                await session.withTransaction(async () => {
+                    const existingTx = await creditTxCol.findOne(
+                        {
+                            type: 'call_deduction',
+                            'reference.billingKey': billingKey,
+                        },
+                        { session, projection: { _id: 1 } }
+                    );
+                    if (existingTx) {
+                        alreadyBilled = true;
+                        return;
+                    }
+
+                    const userFresh = await db.collection('users').findOne(
+                        { _id: user._id },
+                        { session, projection: { _id: 1, email: 1, credits: 1 } }
+                    );
+                    if (!userFresh) throw new Error(`User ${user._id} not found during billing transaction`);
+
+                    if ((userFresh.credits || 0) < cost) {
+                        insufficientCredits = true;
+                        return;
+                    }
+
+                    const deductionResult = await db.collection('users').updateOne(
+                        { _id: user._id, credits: { $gte: cost } },
+                        {
+                            $inc: { credits: -cost },
+                            $set: { updatedAt: new Date() }
+                        },
+                        { session }
+                    );
+
+                    if (deductionResult.modifiedCount === 0 && cost > 0) {
+                        throw new Error('Credit deduction failed (likely race condition or insufficient funds)');
+                    }
+
+                    const userAfter = await db.collection('users').findOne(
+                        { _id: user._id },
+                        { session, projection: { credits: 1 } }
+                    );
+
+                    await creditTxCol.insertOne(
+                        {
+                            userId: user._id,
+                            userEmail: user.email,
+                            type: 'call_deduction',
+                            amount: -cost,
+                            balanceAfter: parseFloat((userAfter?.credits || 0).toFixed(6)),
+                            description: 'Call Usage',
+                            reference: {
+                                campaignId: campaign._id,
+                                campaignName: campaign.name || campaign.campaignName,
+                                callDuration: durationInSeconds,
+                                callId,
+                                leadId,
+                                billingKey,
+                            },
+                            createdAt: new Date(),
+                            updatedAt: new Date()
+                        },
+                        { session }
+                    );
+
+                    const today = new Date().toISOString().split('T')[0];
+                    await db.collection('analytics').updateOne(
+                        {
+                            userId: user.email,
+                            campaignId: campaign._id.toString(),
+                            date: today
+                        },
+                        {
+                            $inc: {
+                                totalMinutes: parseFloat((durationInSeconds / 60).toFixed(4)),
+                                totalCalls: 1,
+                                connectedCalls: duration > 0 ? 1 : 0
+                            },
+                            $set: { updatedAt: new Date() }
+                        },
+                        { upsert: true, session }
+                    );
+
+                    if (callLogUpdateFilter) {
+                        const logUpdate = await db.collection('CallLogs').updateOne(
+                            callLogUpdateFilter,
+                            {
+                                $set: {
+                                    creditsDeducted: true,
+                                    creditsDeductedAmount: cost,
+                                    creditDeductionError: null,
+                                    updatedAt: new Date()
+                                }
+                            },
+                            { session }
+                        );
+                        callLogMatchedInTx = logUpdate.matchedCount;
+                    }
+                });
+            } catch (txErr) {
+                const msg = String(txErr?.message || '');
+                const unsupportedTx =
+                    msg.includes('Transaction numbers are only allowed on a replica set') ||
+                    msg.includes('This MongoDB deployment does not support retryable writes');
+                if (unsupportedTx) {
+                    console.error('❌ [Worker] Billing transaction unavailable (MongoDB deployment lacks transaction support). Skipping deduction for safety.');
+                    this.billingHealth.transactionUnavailableSkips += 1;
+                    if (callLogUpdateFilter) {
+                        await db.collection('CallLogs').updateOne(
+                            callLogUpdateFilter,
+                            {
+                                $set: {
+                                    creditsDeducted: false,
+                                    creditDeductionError: 'transactions_unavailable',
+                                    processedAt: new Date(),
+                                    updatedAt: new Date()
+                                }
+                            }
+                        );
+                    }
+                    return;
+                }
+                this.billingHealth.transactionErrors += 1;
+                throw txErr;
+            } finally {
+                await session.endSession();
+            }
+
+            if (alreadyBilled) {
+                console.log(`ℹ️ [Worker] Credit already recorded for billingKey=${billingKey}; skipping duplicate post-call billing.`);
+                this.billingHealth.alreadyBilledSkips += 1;
+                return;
+            }
+
+            if (insufficientCredits) {
+                console.warn(`⚠️ [Worker] Insufficient credits for ${user.email}. Cost: ${cost}`);
+                this.billingHealth.insufficientCreditSkips += 1;
                 if (callLogUpdateFilter) {
                     const logUpdate = await db.collection('CallLogs').updateOne(
                         callLogUpdateFilter,
@@ -1187,72 +1430,11 @@ export class CallWorker {
                 return;
             }
 
-            const deductionResult = await db.collection('users').updateOne(
-                { _id: user._id, credits: { $gte: cost } },
-                {
-                    $inc: { credits: -cost },
-                    $set: { updatedAt: new Date() }
-                }
-            );
-
-            if (deductionResult.modifiedCount === 0 && cost > 0) {
-                throw new Error('Credit deduction failed (likely race condition or insufficient funds)');
+            if (callLogUpdateFilter && callLogMatchedInTx === 0) {
+                console.warn(`⚠️ [Worker] No CallLog matched for creditsDeducted update (callId=${callId}, leadId=${leadId ?? 'N/A'})`);
             }
-
-            // 5. Log Transaction
-            await db.collection('credittransactions').insertOne({
-                userId: user._id,
-                userEmail: user.email,
-                type: 'call_deduction',
-                amount: -cost,
-                balanceAfter: parseFloat(((user.credits || 0) - cost).toFixed(6)),
-                description: `Call Usage`,
-                reference: {
-                    campaignId: campaign._id,
-                    campaignName: campaign.name || campaign.campaignName,
-                    callDuration: durationInSeconds,
-                    callId: callId,
-                    leadId: leadId
-                },
-                createdAt: new Date(),
-                updatedAt: new Date()
-            });
-
-            // 6. Update Analytics (Using 'analytics' collection based on DB check)
-            const today = new Date().toISOString().split('T')[0];
-            await db.collection('analytics').updateOne(
-                {
-                    userId: user.email, // Analytics uses email or ID? DB check showed 'niya@gmail.com'
-                    campaignId: campaign._id.toString(),
-                    date: today
-                },
-                {
-                    $inc: {
-                        totalMinutes: parseFloat((durationInSeconds / 60).toFixed(4)),
-                        totalCalls: 1,
-                        connectedCalls: duration > 0 ? 1 : 0
-                    },
-                    $set: { updatedAt: new Date() }
-                },
-                { upsert: true }
-            );
-
-            // 7. Update Call Log (by call_id so we update the current attempt, not a previous one for same contact)
-            if (callLogUpdateFilter) {
-                const logUpdate = await db.collection('CallLogs').updateOne(
-                    callLogUpdateFilter,
-                    {
-                        $set: {
-                            creditsDeducted: true,
-                            creditsDeductedAmount: cost,
-                            updatedAt: new Date()
-                        }
-                    }
-                );
-                if (logUpdate.matchedCount === 0) {
-                    console.warn(`⚠️ [Worker] No CallLog matched for creditsDeducted update (callId=${callId}, leadId=${leadId ?? 'N/A'})`);
-                }
-            }
+            this.billingHealth.deductedCalls += 1;
+            this.billingHealth.deductedAmount += Number(cost || 0);
 
             console.log(
                 `✅ [Worker] Post-call actions completed for ${callId}. Cost: ${cost} (billing attempts used: ${billingAttemptsUsed}/${CALL_CREDIT_MAX_ATTEMPTS})`

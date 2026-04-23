@@ -3,6 +3,8 @@ import { CallWorker } from './worker.js';
 const worker = new CallWorker();
 
 console.log('--- Worker Service Starting ---');
+
+await worker.verifyBillingReadiness();
 console.log('🚀 [Worker] Listening for jobs...');
 
 // Graceful shutdown
