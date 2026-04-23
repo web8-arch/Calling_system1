@@ -564,6 +564,9 @@ export class Scheduler {
     constructor() {
         this.queue = createQueue();
         this.isFollowUpEngineStarted = false;
+        this.campaignParallelism = Math.max(1, parseInt(process.env.SCHEDULER_CAMPAIGN_PARALLELISM || '4', 10));
+        this.queueBackpressureThreshold = Math.max(1000, parseInt(process.env.SCHEDULER_QUEUE_BACKPRESSURE_THRESHOLD || '50000', 10));
+        this.queueResumeThreshold = Math.max(500, parseInt(process.env.SCHEDULER_QUEUE_RESUME_THRESHOLD || '30000', 10));
     }
 
     /**
@@ -596,10 +599,38 @@ export class Scheduler {
         }).toArray();
 
         console.log(`🔍 [Scheduler] Found ${activeCampaigns.length} active campaigns.`);
+        await this.processCampaignsWithConcurrency(activeCampaigns, db);
+    }
 
-        for (const campaign of activeCampaigns) {
-            await this.processCampaign(campaign, db);
-        }
+    async isQueueBackpressured() {
+        const counts = await this.queue.getJobCounts('waiting', 'active', 'delayed', 'prioritized');
+        const totalQueued =
+            (counts.waiting || 0) +
+            (counts.active || 0) +
+            (counts.delayed || 0) +
+            (counts.prioritized || 0);
+        const threshold = this.queueBackpressureThreshold;
+        const resumeAt = Math.min(threshold - 1, this.queueResumeThreshold);
+        return {
+            pressured: totalQueued >= threshold,
+            totalQueued,
+            threshold,
+            resumeAt,
+        };
+    }
+
+    async processCampaignsWithConcurrency(campaigns, db) {
+        if (!Array.isArray(campaigns) || campaigns.length === 0) return;
+        let idx = 0;
+        const workers = Array.from({ length: Math.min(this.campaignParallelism, campaigns.length) }, () => (async () => {
+            while (idx < campaigns.length) {
+                const currentIdx = idx++;
+                const campaign = campaigns[currentIdx];
+                if (!campaign) continue;
+                await this.processCampaign(campaign, db);
+            }
+        })());
+        await Promise.all(workers);
     }
 
     /**
@@ -947,6 +978,16 @@ export class Scheduler {
         const batchSize = 1000;
 
         while (await contactCursor.hasNext()) {
+            if (batch.length === 0) {
+                const backpressure = await this.isQueueBackpressured();
+                if (backpressure.pressured) {
+                    console.warn(
+                        `⏸️ [Scheduler] Stopping campaign enqueue due to backpressure ` +
+                        `(campaign=${campaign._id}, queue=${backpressure.totalQueued}, threshold=${backpressure.threshold})`
+                    );
+                    break;
+                }
+            }
             const contact = await contactCursor.next();
 
             batch.push({
@@ -1037,6 +1078,14 @@ export class Scheduler {
 
     async enqueueBatch(jobs) {
         try {
+            const backpressure = await this.isQueueBackpressured();
+            if (backpressure.pressured) {
+                console.warn(
+                    `⏸️ [Scheduler] Backpressure active. Skipping batch enqueue (${jobs.length} jobs). ` +
+                    `queue=${backpressure.totalQueued}, threshold=${backpressure.threshold}, resumeAt=${backpressure.resumeAt}`
+                );
+                return;
+            }
             await this.queue.addBulk(jobs);
             console.log(`✅ [Scheduler] Enqueued batch of ${jobs.length} jobs.`);
 

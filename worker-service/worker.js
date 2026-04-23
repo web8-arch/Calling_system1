@@ -23,6 +23,7 @@ const CALL_CREDIT_MAX_ATTEMPTS = parseInt(process.env.CALL_CREDIT_MAX_ATTEMPTS |
 const CALL_CREDIT_RETRY_MS = parseInt(process.env.CALL_CREDIT_RETRY_MS || '3000', 10);
 const CALL_COMPLETION_CONFIRM_MS = parseInt(process.env.CALL_COMPLETION_CONFIRM_MS || '6000', 10);
 const BILLING_HEALTH_LOG_INTERVAL_MS = parseInt(process.env.BILLING_HEALTH_LOG_INTERVAL_MS || '300000', 10);
+const SLOT_HEARTBEAT_INTERVAL_MS = Math.max(2000, parseInt(process.env.SLOT_HEARTBEAT_INTERVAL_MS || '15000', 10));
 
 /**
  * Billable duration (seconds) from CallLog events. Prefers call_answered + call_hangup timestamps, then cdr_push.Duration when ANSWER.
@@ -484,7 +485,7 @@ export class CallWorker {
 
         // 2. Acquire Distributed Concurrency Slot (Wait for availability)
         let hasSlot = false;
-        const checkInterval = 500; // Reduced to 500ms for faster acquisition
+        const initialCheckInterval = 500;
         const startTime = Date.now();
         const maxWaitTime = 3600000; // 1 hour safety timeout
 
@@ -513,14 +514,26 @@ export class CallWorker {
                     return;
                 }
 
-                // Wait before next check
-                await new Promise(resolve => setTimeout(resolve, checkInterval));
+                // Exponential backoff + jitter to avoid control-plane thundering herd.
+                const waitedMs = Date.now() - startTime;
+                const backoffFactor = Math.min(20, Math.floor(waitedMs / 5000));
+                const nextWait = Math.min(10000, Math.floor(initialCheckInterval * Math.pow(1.25, backoffFactor)));
+                const jitter = Math.floor(Math.random() * 250);
+                await new Promise(resolve => setTimeout(resolve, nextWait + jitter));
             }
         }
 
         let shouldReleaseSlot = true; // Declare here so it is accessible in finally{}
         let currentlyHoldingSlot = false;
         let attemptStartedAt = 0; // Set right after executeCall; used for nextRetryAt so delay is from attempt start, not poll end
+        let lastSlotHeartbeatAt = 0;
+        const heartbeatSlot = async (force = false) => {
+            if (!currentlyHoldingSlot) return;
+            const now = Date.now();
+            if (!force && now - lastSlotHeartbeatAt < SLOT_HEARTBEAT_INTERVAL_MS) return;
+            await concurrencyGuard.touchSlot(campaignId, userId);
+            lastSlotHeartbeatAt = now;
+        };
 
         try {
             // 3. Update Status to 'processing'
@@ -549,6 +562,7 @@ export class CallWorker {
             const result = await this.executeCall(job.data);
             attemptStartedAt = Date.now(); // Capture once; used for nextRetryAt and callAttempts timestamp (retry delay from attempt start)
             currentlyHoldingSlot = true; // Still holding the slot from the initiation acquisition
+            await heartbeatSlot(true);
 
             // 6. Polling Logic: Wait for the API to register the call (Status 1, 2, or 3)
             console.log(`⏳ [Worker] Waiting for call registration for ${contactId}...`);
@@ -596,13 +610,18 @@ export class CallWorker {
                                 break;
                             }
 
-                            await new Promise(resolve => setTimeout(resolve, 2000));
+                            const waitedMs = Date.now() - startTime;
+                            const backoffFactor = Math.min(20, Math.floor(waitedMs / 5000));
+                            const nextWait = Math.min(10000, Math.floor(2000 * Math.pow(1.15, backoffFactor)));
+                            const jitter = Math.floor(Math.random() * 300);
+                            await new Promise(resolve => setTimeout(resolve, nextWait + jitter));
                         }
                     }
 
                     if (reAcquired) {
                         currentlyHoldingSlot = true;
                         shouldReleaseSlot = true;
+                        await heartbeatSlot(true);
 
                         // Now wait for completion
                         console.log(`📡 [Worker] Slot held for ${contactId}. Waiting for completion...`);
@@ -613,6 +632,7 @@ export class CallWorker {
             } else if (callStatus === 2) {
                 // RUNNING immediately: Keep the slot and wait for completion
                 console.log(`📡 [Worker] Call ${contactId} is already RUNNING. Keeping slot and waiting for completion...`);
+                await heartbeatSlot();
                 updatedContact = await this.pollStatus(contactId, [3], 600000, 2000);
                 callStatus = parseInt(updatedContact?.callReceiveStatus) || 0;
             } else if (callStatus === 3) {
