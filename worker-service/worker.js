@@ -24,6 +24,36 @@ const CALL_CREDIT_RETRY_MS = parseInt(process.env.CALL_CREDIT_RETRY_MS || '3000'
 const CALL_COMPLETION_CONFIRM_MS = parseInt(process.env.CALL_COMPLETION_CONFIRM_MS || '6000', 10);
 const BILLING_HEALTH_LOG_INTERVAL_MS = parseInt(process.env.BILLING_HEALTH_LOG_INTERVAL_MS || '300000', 10);
 const SLOT_HEARTBEAT_INTERVAL_MS = Math.max(2000, parseInt(process.env.SLOT_HEARTBEAT_INTERVAL_MS || '15000', 10));
+const MONGO_TX_MAX_ATTEMPTS = Math.max(1, parseInt(process.env.MONGO_TX_MAX_ATTEMPTS || '4', 10));
+const MONGO_TX_RETRY_BASE_MS = Math.max(10, parseInt(process.env.MONGO_TX_RETRY_BASE_MS || '75', 10));
+const MONGO_TX_RETRY_CAP_MS = Math.max(MONGO_TX_RETRY_BASE_MS, parseInt(process.env.MONGO_TX_RETRY_CAP_MS || '1200', 10));
+
+function isHttpsOrLocal(urlStr) {
+    try {
+        const parsed = new URL(urlStr);
+        if (parsed.protocol === 'https:') return true;
+        if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') return true;
+        return false;
+    } catch {
+        return false;
+    }
+}
+
+function enforceSecureUpstream(name, urlStr) {
+    if (!urlStr) return;
+    if (process.env.NODE_ENV !== 'production') return;
+    if (!isHttpsOrLocal(urlStr)) {
+        throw new Error(`[Security] ${name} must be HTTPS in production: ${urlStr}`);
+    }
+}
+
+function validateWorkerJobData(jobData) {
+    if (!jobData || typeof jobData !== 'object') return { ok: false, reason: 'missing_job_data' };
+    if (!jobData.campaignId || !ObjectId.isValid(String(jobData.campaignId))) return { ok: false, reason: 'invalid_campaign_id' };
+    if (!jobData.contactId || !ObjectId.isValid(String(jobData.contactId))) return { ok: false, reason: 'invalid_contact_id' };
+    if (!jobData.userId) return { ok: false, reason: 'missing_user_id' };
+    return { ok: true };
+}
 
 /**
  * Billable duration (seconds) from CallLog events. Prefers call_answered + call_hangup timestamps, then cdr_push.Duration when ANSWER.
@@ -130,6 +160,31 @@ function extractNodeErrnoCode(err, depth = 0) {
     return undefined;
 }
 
+function isRetryableMongoTransactionError(err) {
+    if (!err) return false;
+
+    if (Array.isArray(err.errorLabels)) {
+        if (err.errorLabels.includes('TransientTransactionError')) return true;
+        if (err.errorLabels.includes('UnknownTransactionCommitResult')) return true;
+    }
+
+    if (err.code === 112 || err.codeName === 'WriteConflict') return true;
+
+    const msg = String(err.message || '').toLowerCase();
+    if (msg.includes('write conflict')) return true;
+    if (msg.includes('temporarily unavailable')) return true;
+    if (msg.includes('lock timeout')) return true;
+
+    return false;
+}
+
+function mongoTxRetryDelayMs(attempt) {
+    const exp = Math.max(0, attempt - 1);
+    const base = Math.min(MONGO_TX_RETRY_CAP_MS, MONGO_TX_RETRY_BASE_MS * (2 ** exp));
+    const jitter = Math.floor(Math.random() * Math.max(25, Math.floor(base * 0.3)));
+    return Math.min(MONGO_TX_RETRY_CAP_MS, base + jitter);
+}
+
 /**
  * User- and DB-friendly message for transport-level fetch failures to the Call API.
  */
@@ -177,6 +232,50 @@ function isPastCampaignEnd(campaign) {
     return now > endDt;
 }
 
+const KB_USD_PER_INR = Number.parseFloat(process.env.KB_USD_PER_INR || String(1 / 94));
+
+function roundSix(value) {
+    return Number.parseFloat((value || 0).toFixed(6));
+}
+
+function toFiniteNumber(value) {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function convertInrToUsd(inrValue) {
+    const inr = toFiniteNumber(inrValue);
+    if (inr === null) return 0;
+    return roundSix(inr * KB_USD_PER_INR);
+}
+
+function toObjectIdOrNull(value) {
+    if (!value) return null;
+    try {
+        return new ObjectId(String(value));
+    } catch {
+        return null;
+    }
+}
+
+function extractKnowledgeRefs(campaign) {
+    const refs = new Set();
+    const knowledgeBaseIds = campaign?.selectedKnowledgebases;
+
+    if (Array.isArray(knowledgeBaseIds)) {
+        for (const item of knowledgeBaseIds) {
+            if (!item) continue;
+            if (typeof item === 'string' || typeof item === 'number') {
+                refs.add(String(item));
+                continue;
+            }
+            if (item.fileId) refs.add(String(item.fileId));
+        }
+    }
+
+    return [...refs];
+}
+
 async function shouldIgnoreEndWindow({ campaign, metadata, db }) {
     if (metadata?.ignoreEndWindow === true) return true;
     // Fallback for already-enqueued jobs that don't have metadata.ignoreEndWindow yet:
@@ -194,6 +293,9 @@ async function shouldIgnoreEndWindow({ campaign, metadata, db }) {
 
 export class CallWorker {
     constructor() {
+        enforceSecureUpstream('CALL_API_BASIC_URL', process.env.CALL_API_BASIC_URL || '');
+        enforceSecureUpstream('CALL_API_PREMIUM_URL', process.env.CALL_API_PREMIUM_URL || '');
+        enforceSecureUpstream('ANALYSIS_API_URL', config.analysis?.apiUrl || '');
         this.postCallQueue = createPostCallQueue();
         this.billingIndexesEnsured = false;
         this.billingHealth = {
@@ -292,6 +394,37 @@ export class CallWorker {
             this.postCallWorker.close(),
             this.postCallQueue.close()
         ]);
+    }
+
+    async resolveKbRatePerMinute(db, campaign) {
+        const selectedFileIds = extractKnowledgeRefs(campaign);
+        let docs = [];
+
+        try {
+            if (selectedFileIds.length > 0) {
+                docs = await db.collection('knowledges').find({
+                    'pdfDocuments.fileId': { $in: selectedFileIds }
+                }).toArray();
+            }
+        } catch (error) {
+            console.warn(`⚠️ [Worker] Failed loading knowledges for campaign ${campaign?._id}: ${error.message}`);
+            return 0;
+        }
+
+        let kbRatePerMinute = 0;
+        for (const doc of docs) {
+            const pdfDocuments = Array.isArray(doc?.pdfDocuments) ? doc.pdfDocuments : [];
+            for (const fileDoc of pdfDocuments) {
+                if (!fileDoc?.fileId || !selectedFileIds.includes(String(fileDoc.fileId))) continue;
+                // Strict source: only from knowledges.pdfDocuments.metadata.kbRatePerMinute (stored in INR/min).
+                const direct = toFiniteNumber(fileDoc?.metadata?.kbRatePerMinute);
+                if (direct !== null && direct >= 0) {
+                    kbRatePerMinute += convertInrToUsd(direct);
+                }
+            }
+        }
+
+        return roundSix(kbRatePerMinute);
     }
 
     async ensureBillingIndexes(db) {
@@ -424,6 +557,11 @@ export class CallWorker {
     }
 
     async processJob(job) {
+        const payloadValidation = validateWorkerJobData(job?.data);
+        if (!payloadValidation.ok) {
+            console.warn(`⚠️ [Worker] Dropping malformed job ${job?.id || '(unknown)'}: ${payloadValidation.reason}`);
+            return;
+        }
         const { campaignId, contactId, userId, metadata } = job.data;
         const contactObjId = new ObjectId(contactId);
         const { campaignLimit, userLimit, businessHours } = metadata;
@@ -458,6 +596,16 @@ export class CallWorker {
         const ignoreEndWindow = await shouldIgnoreEndWindow({ campaign, metadata, db });
         if (!ignoreEndWindow && isPastCampaignEnd(campaign)) {
             const endDt = getCampaignEndDateTime(campaign);
+            await db.collection('campaigns').updateOne(
+                { _id: campaign._id, status: { $ne: 'expired' } },
+                {
+                    $set: {
+                        status: 'expired',
+                        expiredAt: new Date(),
+                        updatedAt: new Date()
+                    }
+                }
+            );
             console.log(`⏹️ [Worker] Job ${job.id} ignored: Campaign ${campaignId} is past end window (${endDt?.toISO?.() || 'unknown'}).`);
             return;
         }
@@ -559,7 +707,12 @@ export class CallWorker {
             }
 
             // 5. Execute API Call
-            const result = await this.executeCall(job.data);
+            const callAttempt = Array.isArray(currentContact.callAttempts) ? currentContact.callAttempts.length + 1 : 1;
+            const result = await this.executeCall({
+                ...job.data,
+                callAttempt,
+                idempotencyKey: `call:${campaignId}:${contactId}:${callAttempt}`
+            });
             attemptStartedAt = Date.now(); // Capture once; used for nextRetryAt and callAttempts timestamp (retry delay from attempt start)
             currentlyHoldingSlot = true; // Still holding the slot from the initiation acquisition
             await heartbeatSlot(true);
@@ -944,6 +1097,8 @@ export class CallWorker {
             campaign_id: data.campaignId,
             contact_id: data.contactId
         };
+        const outboundIdempotencyKey =
+            data.idempotencyKey || `call:${data.campaignId}:${data.contactId}:${data.callAttempt || 1}`;
 
         console.log(`📞 [Worker] Making ${tier} call to ${data.phone || data.contactId} via API (${url})...`);
 
@@ -953,7 +1108,8 @@ export class CallWorker {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'X-API-Key': config.api.callingKey
+                    'X-API-Key': config.api.callingKey,
+                    'X-Idempotency-Key': outboundIdempotencyKey
                 },
                 body: JSON.stringify(payload)
             });
@@ -973,7 +1129,10 @@ export class CallWorker {
 
         const result = await response.json();
 
-        console.log(`✅ [Worker] API call successful:`, result);
+        console.log(`✅ [Worker] API call successful`, {
+            callId: result?.call?.id || result?.call_id || result?.id || null,
+            status: result?.status || result?.call?.status || null
+        });
         return {
             success: true,
             apiResponse: result,
@@ -1229,6 +1388,11 @@ export class CallWorker {
                 ratePerMinute = 0.08;
             }
 
+            const kbRatePerMinute = await this.resolveKbRatePerMinute(db, campaign);
+            const totalRatePerMinute = roundSix(ratePerMinute + kbRatePerMinute);
+            console.log(
+                `💳 [Worker] Billing rates — plan: ${ratePerMinute}/min, kb: ${kbRatePerMinute}/min, total: ${totalRatePerMinute}/min`
+            );
             const stableCallId =
                 callId && !String(callId).startsWith('call_')
                     ? String(callId)
@@ -1284,7 +1448,7 @@ export class CallWorker {
                 partialMinuteFraction = (bracket?.percentOfRatePerMinute ?? 100) / 100;
             }
 
-            const cost = parseFloat(((fullMinutes * ratePerMinute) + (partialMinuteFraction * ratePerMinute)).toFixed(6));
+            const cost = parseFloat(((fullMinutes * totalRatePerMinute) + (partialMinuteFraction * totalRatePerMinute)).toFixed(6));
             const creditTxCol = db.collection('credittransactions');
             await this.ensureBillingIndexes(db);
 
@@ -1292,134 +1456,136 @@ export class CallWorker {
             let insufficientCredits = false;
             let callLogMatchedInTx = null;
             const mongoClient = await getMongoClient();
-            const session = mongoClient.startSession();
+            for (let txAttempt = 1; txAttempt <= MONGO_TX_MAX_ATTEMPTS; txAttempt++) {
+                const session = mongoClient.startSession();
+                try {
+                    let attemptAlreadyBilled = false;
+                    let attemptInsufficientCredits = false;
+                    let attemptCallLogMatchedInTx = null;
 
-            try {
-                await session.withTransaction(async () => {
-                    const existingTx = await creditTxCol.findOne(
-                        {
-                            type: 'call_deduction',
-                            'reference.billingKey': billingKey,
-                        },
-                        { session, projection: { _id: 1 } }
-                    );
-                    if (existingTx) {
-                        alreadyBilled = true;
-                        return;
-                    }
-
-                    const userFresh = await db.collection('users').findOne(
-                        { _id: user._id },
-                        { session, projection: { _id: 1, email: 1, credits: 1 } }
-                    );
-                    if (!userFresh) throw new Error(`User ${user._id} not found during billing transaction`);
-
-                    if ((userFresh.credits || 0) < cost) {
-                        insufficientCredits = true;
-                        return;
-                    }
-
-                    const deductionResult = await db.collection('users').updateOne(
-                        { _id: user._id, credits: { $gte: cost } },
-                        {
-                            $inc: { credits: -cost },
-                            $set: { updatedAt: new Date() }
-                        },
-                        { session }
-                    );
-
-                    if (deductionResult.modifiedCount === 0 && cost > 0) {
-                        throw new Error('Credit deduction failed (likely race condition or insufficient funds)');
-                    }
-
-                    const userAfter = await db.collection('users').findOne(
-                        { _id: user._id },
-                        { session, projection: { credits: 1 } }
-                    );
-
-                    await creditTxCol.insertOne(
-                        {
-                            userId: user._id,
-                            userEmail: user.email,
-                            type: 'call_deduction',
-                            amount: -cost,
-                            balanceAfter: parseFloat((userAfter?.credits || 0).toFixed(6)),
-                            description: 'Call Usage',
-                            reference: {
-                                campaignId: campaign._id,
-                                campaignName: campaign.name || campaign.campaignName,
-                                callDuration: durationInSeconds,
-                                callId,
-                                leadId,
-                                billingKey,
-                            },
-                            createdAt: new Date(),
-                            updatedAt: new Date()
-                        },
-                        { session }
-                    );
-
-                    const today = new Date().toISOString().split('T')[0];
-                    await db.collection('analytics').updateOne(
-                        {
-                            userId: user.email,
-                            campaignId: campaign._id.toString(),
-                            date: today
-                        },
-                        {
-                            $inc: {
-                                totalMinutes: parseFloat((durationInSeconds / 60).toFixed(4)),
-                                totalCalls: 1,
-                                connectedCalls: duration > 0 ? 1 : 0
-                            },
-                            $set: { updatedAt: new Date() }
-                        },
-                        { upsert: true, session }
-                    );
-
-                    if (callLogUpdateFilter) {
-                        const logUpdate = await db.collection('CallLogs').updateOne(
-                            callLogUpdateFilter,
+                    await session.withTransaction(async () => {
+                        const existingTx = await creditTxCol.findOne(
                             {
-                                $set: {
-                                    creditsDeducted: true,
-                                    creditsDeductedAmount: cost,
-                                    creditDeductionError: null,
-                                    updatedAt: new Date()
-                                }
+                                type: 'call_deduction',
+                                'reference.billingKey': billingKey,
+                            },
+                            { session, projection: { _id: 1 } }
+                        );
+                        if (existingTx) {
+                            attemptAlreadyBilled = true;
+                            return;
+                        }
+
+                        const userFresh = await db.collection('users').findOne(
+                            { _id: user._id },
+                            { session, projection: { _id: 1, email: 1, credits: 1 } }
+                        );
+                        if (!userFresh) throw new Error(`User ${user._id} not found during billing transaction`);
+
+                        if ((userFresh.credits || 0) < cost) {
+                            attemptInsufficientCredits = true;
+                            return;
+                        }
+
+                        const deductionResult = await db.collection('users').updateOne(
+                            { _id: user._id, credits: { $gte: cost } },
+                            {
+                                $inc: { credits: -cost },
+                                $set: { updatedAt: new Date() }
                             },
                             { session }
                         );
-                        callLogMatchedInTx = logUpdate.matchedCount;
-                    }
-                });
-            } catch (txErr) {
-                const msg = String(txErr?.message || '');
-                const unsupportedTx =
-                    msg.includes('Transaction numbers are only allowed on a replica set') ||
-                    msg.includes('This MongoDB deployment does not support retryable writes');
-                if (unsupportedTx) {
-                    console.error('❌ [Worker] Billing transaction unavailable (MongoDB deployment lacks transaction support). Skipping deduction for safety.');
-                    this.billingHealth.transactionUnavailableSkips += 1;
-                    if (callLogUpdateFilter) {
-                        await db.collection('CallLogs').updateOne(
-                            callLogUpdateFilter,
-                            {
-                                $set: {
-                                    creditsDeducted: false,
-                                    creditDeductionError: 'transactions_unavailable',
-                                    processedAt: new Date(),
-                                    updatedAt: new Date()
-                                }
-                            }
+
+                        if (deductionResult.modifiedCount === 0 && cost > 0) {
+                            throw new Error('Credit deduction failed (likely race condition or insufficient funds)');
+                        }
+
+                        const userAfter = await db.collection('users').findOne(
+                            { _id: user._id },
+                            { session, projection: { credits: 1 } }
                         );
+
+
+                        const today = new Date().toISOString().split('T')[0];
+                        await db.collection('analytics').updateOne(
+                            {
+                                userId: user.email,
+                                campaignId: campaign._id.toString(),
+                                date: today
+                            },
+                            {
+                                $inc: {
+                                    totalMinutes: parseFloat((durationInSeconds / 60).toFixed(4)),
+                                    totalCalls: 1,
+                                    connectedCalls: duration > 0 ? 1 : 0
+                                },
+                                $set: { updatedAt: new Date() }
+                            },
+                            { upsert: true, session }
+                        );
+
+                        if (callLogUpdateFilter) {
+                            const logUpdate = await db.collection('CallLogs').updateOne(
+                                callLogUpdateFilter,
+                                {
+                                    $set: {
+                                        creditsDeducted: true,
+                                        creditsDeductedAmount: cost,
+                                        creditDeductionError: null,
+                                        updatedAt: new Date()
+                                    }
+                                },
+                                { session }
+                            );
+                            attemptCallLogMatchedInTx = logUpdate.matchedCount;
+                        }
+                    });
+
+                    alreadyBilled = attemptAlreadyBilled;
+                    insufficientCredits = attemptInsufficientCredits;
+                    callLogMatchedInTx = attemptCallLogMatchedInTx;
+                    break;
+                } catch (txErr) {
+                    const msg = String(txErr?.message || '');
+                    const unsupportedTx =
+                        msg.includes('Transaction numbers are only allowed on a replica set') ||
+                        msg.includes('This MongoDB deployment does not support retryable writes');
+                    if (unsupportedTx) {
+                        console.error('❌ [Worker] Billing transaction unavailable (MongoDB deployment lacks transaction support). Skipping deduction for safety.');
+                        this.billingHealth.transactionUnavailableSkips += 1;
+                        if (callLogUpdateFilter) {
+                            await db.collection('CallLogs').updateOne(
+                                callLogUpdateFilter,
+                                {
+                                    $set: {
+                                        creditsDeducted: false,
+                                        creditDeductionError: 'transactions_unavailable',
+                                        processedAt: new Date(),
+                                        updatedAt: new Date()
+                                    }
+                                }
+                            );
+                        }
+                        return;
                     }
-                    return;
+
+                    const retryable = isRetryableMongoTransactionError(txErr);
+                    const canRetry = retryable && txAttempt < MONGO_TX_MAX_ATTEMPTS;
+                    if (canRetry) {
+                        const waitMs = mongoTxRetryDelayMs(txAttempt);
+                        console.warn(
+                            `⚠️ [Worker] Billing transaction transient error ` +
+                            `(attempt ${txAttempt}/${MONGO_TX_MAX_ATTEMPTS}) for billingKey=${billingKey}. Retrying in ${waitMs}ms. Error: ${txErr.message}`
+                        );
+                        await new Promise(resolve => setTimeout(resolve, waitMs));
+                        continue;
+                    }
+
+                    this.billingHealth.transactionErrors += 1;
+                    throw txErr;
+                } finally {
+                    await session.endSession();
                 }
-                this.billingHealth.transactionErrors += 1;
-                throw txErr;
-            } finally {
-                await session.endSession();
             }
 
             if (alreadyBilled) {
@@ -1450,63 +1616,134 @@ export class CallWorker {
                 return;
             }
 
-            if (callLogUpdateFilter && callLogMatchedInTx === 0) {
-                console.warn(`⚠️ [Worker] No CallLog matched for creditsDeducted update (callId=${callId}, leadId=${leadId ?? 'N/A'})`);
-            }
-            this.billingHealth.deductedCalls += 1;
-            this.billingHealth.deductedAmount += Number(cost || 0);
-
-            console.log(
-                `✅ [Worker] Post-call actions completed for ${callId}. Cost: ${cost} (billing attempts used: ${billingAttemptsUsed}/${CALL_CREDIT_MAX_ATTEMPTS})`
+            const deductionResult = await db.collection('users').updateOne(
+                { _id: user._id, credits: { $gte: cost } },
+                {
+                    $inc: { credits: -cost },
+                    $set: { updatedAt: new Date() }
+                }
             );
 
-            // 8. Trigger Call Analysis API (retries: indexing often lags a few seconds after call end)
-            if (callId && !String(callId).startsWith('call_')) {
-                try {
-                    // Give transcript/turns pipeline a brief head start before first analysis request.
-                    if (ANALYSIS_API_INITIAL_DELAY_MS > 0) {
-                        await new Promise(r => setTimeout(r, ANALYSIS_API_INITIAL_DELAY_MS));
-                    }
-
-                    // ANALYSIS_API_URL can be base (http://host:5000) or prefix (http://host:5000/analyze/call)
-                    const rawAnalysis = (config.analysis?.apiUrl || 'http://72.60.221.48:5000').replace(/\/$/, '');
-                    const analysisUrl = rawAnalysis.includes('/analyze/call')
-                        ? `${rawAnalysis}/${encodeURIComponent(String(callId))}`
-                        : `${rawAnalysis}/analyze/call/${encodeURIComponent(String(callId))}`;
-
-                    for (let attempt = 1; attempt <= ANALYSIS_API_MAX_ATTEMPTS; attempt++) {
-                        console.log(`🧠 [Worker] Triggering Analysis API for Call ID: ${callId} (attempt ${attempt}/${ANALYSIS_API_MAX_ATTEMPTS})...`);
-                        const analysisResponse = await fetch(analysisUrl, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' }
-                        });
-
-                        if (analysisResponse.ok) {
-                            console.log(`✅ [Worker] Analysis API triggered successfully for ${callId}`);
-                            break;
-                        }
-
-                        const errText = await analysisResponse.text();
-                        const notReady =
-                            analysisResponse.status === 404 ||
-                            analysisResponse.status === 503 ||
-                            analysisResponse.status === 502 ||
-                            /not\s*found/i.test(errText);
-
-                        if (notReady && attempt < ANALYSIS_API_MAX_ATTEMPTS) {
-                            console.warn(`⚠️ [Worker] Analysis API not ready for ${callId} (${analysisResponse.status}), retry in ${ANALYSIS_API_RETRY_MS}ms...`);
-                            await new Promise(r => setTimeout(r, ANALYSIS_API_RETRY_MS));
-                            continue;
-                        }
-
-                        console.warn(`⚠️ [Worker] Analysis API failed for ${callId}:`, errText);
-                        break;
-                    }
-                } catch (analysisError) {
-                    console.error(`❌ [Worker] Error triggering Analysis API:`, analysisError.message);
-                }
+            if (deductionResult.modifiedCount === 0 && cost > 0) {
+                throw new Error('Credit deduction failed (likely race condition or insufficient funds)');
             }
 
+            // 5. Log Transaction
+            await db.collection('credittransactions').insertOne({
+                userId: user._id,
+                userEmail: user.email,
+                type: 'call_deduction',
+                amount: -cost,
+                balanceAfter: parseFloat(((user.credits || 0) - cost).toFixed(6)),
+                description: `Call Usage`,
+                reference: {
+                    campaignId: campaign._id,
+                    campaignName: campaign.name || campaign.campaignName,
+                    callDuration: durationInSeconds,
+                    callId: callId,
+                    leadId: leadId,
+                    planRatePerMinute: roundSix(ratePerMinute),
+                    kbRatePerMinute,
+                    totalRatePerMinute
+                },
+                createdAt: new Date(),
+                updatedAt: new Date()
+            });
+
+            // 6. Update Analytics (Using 'analytics' collection based on DB check)
+            const today = new Date().toISOString().split('T')[0];
+            await db.collection('analytics').updateOne(
+                {
+                    userId: user.email, // Analytics uses email or ID? DB check showed 'niya@gmail.com'
+                    campaignId: campaign._id.toString(),
+                    date: today
+                },
+                {
+                    $inc: {
+                        totalMinutes: parseFloat((durationInSeconds / 60).toFixed(4)),
+                        totalCalls: 1,
+                        connectedCalls: duration > 0 ? 1 : 0
+                    },
+                    $set: { updatedAt: new Date() }
+                },
+                { upsert: true }
+            );
+
+            // 7. Update Call Log (by call_id so we update the current attempt, not a previous one for same contact)
+            if (callLogUpdateFilter) {
+                const logUpdate = await db.collection('CallLogs').updateOne(
+                    callLogUpdateFilter,
+                    {
+                        $set: {
+                            creditsDeducted: true,
+                            creditsDeductedAmount: cost,
+                            planRatePerMinute: roundSix(ratePerMinute),
+                            kbRatePerMinute,
+                            totalRatePerMinute,
+                            updatedAt: new Date()
+                        }
+                    }
+                );
+                if (logUpdate.matchedCount === 0) {
+                    console.warn(`⚠️ [Worker] No CallLog matched for creditsDeducted update (callId=${callId}, leadId=${leadId ?? 'N/A'})`);
+                }
+                if (callLogUpdateFilter && callLogMatchedInTx === 0) {
+                    console.warn(`⚠️ [Worker] No CallLog matched for creditsDeducted update (callId=${callId}, leadId=${leadId ?? 'N/A'})`);
+                }
+                this.billingHealth.deductedCalls += 1;
+                this.billingHealth.deductedAmount += Number(cost || 0);
+
+                console.log(
+                    `✅ [Worker] Post-call actions completed for ${callId}. Cost: ${cost} (billing attempts used: ${billingAttemptsUsed}/${CALL_CREDIT_MAX_ATTEMPTS})`
+                );
+
+                // 8. Trigger Call Analysis API (retries: indexing often lags a few seconds after call end)
+                if (callId && !String(callId).startsWith('call_')) {
+                    try {
+                        // Give transcript/turns pipeline a brief head start before first analysis request.
+                        if (ANALYSIS_API_INITIAL_DELAY_MS > 0) {
+                            await new Promise(r => setTimeout(r, ANALYSIS_API_INITIAL_DELAY_MS));
+                        }
+
+                        // ANALYSIS_API_URL can be base (http://host:5000) or prefix (http://host:5000/analyze/call)
+                        const rawAnalysis = (config.analysis?.apiUrl || 'http://72.60.221.48:5000').replace(/\/$/, '');
+                        const analysisUrl = rawAnalysis.includes('/analyze/call')
+                            ? `${rawAnalysis}/${encodeURIComponent(String(callId))}`
+                            : `${rawAnalysis}/analyze/call/${encodeURIComponent(String(callId))}`;
+
+                        for (let attempt = 1; attempt <= ANALYSIS_API_MAX_ATTEMPTS; attempt++) {
+                            console.log(`🧠 [Worker] Triggering Analysis API for Call ID: ${callId} (attempt ${attempt}/${ANALYSIS_API_MAX_ATTEMPTS})...`);
+                            const analysisResponse = await fetch(analysisUrl, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' }
+                            });
+
+                            if (analysisResponse.ok) {
+                                console.log(`✅ [Worker] Analysis API triggered successfully for ${callId}`);
+                                break;
+                            }
+
+                            const errText = await analysisResponse.text();
+                            const notReady =
+                                analysisResponse.status === 404 ||
+                                analysisResponse.status === 503 ||
+                                analysisResponse.status === 502 ||
+                                /not\s*found/i.test(errText);
+
+                            if (notReady && attempt < ANALYSIS_API_MAX_ATTEMPTS) {
+                                console.warn(`⚠️ [Worker] Analysis API not ready for ${callId} (${analysisResponse.status}), retry in ${ANALYSIS_API_RETRY_MS}ms...`);
+                                await new Promise(r => setTimeout(r, ANALYSIS_API_RETRY_MS));
+                                continue;
+                            }
+
+                            console.warn(`⚠️ [Worker] Analysis API failed for ${callId}:`, errText);
+                            break;
+                        }
+                    } catch (analysisError) {
+                        console.error(`❌ [Worker] Error triggering Analysis API:`, analysisError.message);
+                    }
+                }
+            }
         } catch (error) {
             console.error(`❌ [Worker] triggerPostCallActions CRITICAL ERROR:`, error.message);
             await this.logErrorToDb({
