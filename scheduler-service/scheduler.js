@@ -564,6 +564,9 @@ export class Scheduler {
     constructor() {
         this.queue = createQueue();
         this.isFollowUpEngineStarted = false;
+        this.campaignParallelism = Math.max(1, parseInt(process.env.SCHEDULER_CAMPAIGN_PARALLELISM || '4', 10));
+        this.queueBackpressureThreshold = Math.max(1000, parseInt(process.env.SCHEDULER_QUEUE_BACKPRESSURE_THRESHOLD || '50000', 10));
+        this.queueResumeThreshold = Math.max(500, parseInt(process.env.SCHEDULER_QUEUE_RESUME_THRESHOLD || '30000', 10));
     }
 
     /**
@@ -596,10 +599,38 @@ export class Scheduler {
         }).toArray();
 
         console.log(`🔍 [Scheduler] Found ${activeCampaigns.length} active campaigns.`);
+        await this.processCampaignsWithConcurrency(activeCampaigns, db);
+    }
 
-        for (const campaign of activeCampaigns) {
-            await this.processCampaign(campaign, db);
-        }
+    async isQueueBackpressured() {
+        const counts = await this.queue.getJobCounts('waiting', 'active', 'delayed', 'prioritized');
+        const totalQueued =
+            (counts.waiting || 0) +
+            (counts.active || 0) +
+            (counts.delayed || 0) +
+            (counts.prioritized || 0);
+        const threshold = this.queueBackpressureThreshold;
+        const resumeAt = Math.min(threshold - 1, this.queueResumeThreshold);
+        return {
+            pressured: totalQueued >= threshold,
+            totalQueued,
+            threshold,
+            resumeAt,
+        };
+    }
+
+    async processCampaignsWithConcurrency(campaigns, db) {
+        if (!Array.isArray(campaigns) || campaigns.length === 0) return;
+        let idx = 0;
+        const workers = Array.from({ length: Math.min(this.campaignParallelism, campaigns.length) }, () => (async () => {
+            while (idx < campaigns.length) {
+                const currentIdx = idx++;
+                const campaign = campaigns[currentIdx];
+                if (!campaign) continue;
+                await this.processCampaign(campaign, db);
+            }
+        })());
+        await Promise.all(workers);
     }
 
     /**
@@ -947,6 +978,16 @@ export class Scheduler {
         const batchSize = 1000;
 
         while (await contactCursor.hasNext()) {
+            if (batch.length === 0) {
+                const backpressure = await this.isQueueBackpressured();
+                if (backpressure.pressured) {
+                    console.warn(
+                        `⏸️ [Scheduler] Stopping campaign enqueue due to backpressure ` +
+                        `(campaign=${campaign._id}, queue=${backpressure.totalQueued}, threshold=${backpressure.threshold})`
+                    );
+                    break;
+                }
+            }
             const contact = await contactCursor.next();
 
             batch.push({
@@ -989,11 +1030,12 @@ export class Scheduler {
             status: { $nin: ['completed', 'failed'] }
         });
 
-        // PRODUCTION GUARD: Check if there are any AI analyses for this campaign still being processed.
-        // We must not complete the campaign if a follow-up is about to be scheduled.
+        // PRODUCTION GUARD: Only block completion for analyses that can schedule follow-ups.
+        // Non-call next actions (e.g. "None") are intentionally excluded so campaigns can finish.
         const pendingAnalyses = await db.collection('call_analysis').countDocuments({
             campaign_id: campaign._id.toString(),
-            followUpProcessed: { $ne: true }
+            followUpProcessed: { $ne: true },
+            'analysis_data.Next_Action.Type': { $regex: /^call$/i }
         });
 
         if (pendingCount === 0 && pendingAnalyses === 0) {
@@ -1036,6 +1078,14 @@ export class Scheduler {
 
     async enqueueBatch(jobs) {
         try {
+            const backpressure = await this.isQueueBackpressured();
+            if (backpressure.pressured) {
+                console.warn(
+                    `⏸️ [Scheduler] Backpressure active. Skipping batch enqueue (${jobs.length} jobs). ` +
+                    `queue=${backpressure.totalQueued}, threshold=${backpressure.threshold}, resumeAt=${backpressure.resumeAt}`
+                );
+                return;
+            }
             await this.queue.addBulk(jobs);
             console.log(`✅ [Scheduler] Enqueued batch of ${jobs.length} jobs.`);
 
@@ -1163,13 +1213,33 @@ export class Scheduler {
                 _id: { $in: campaignIds.map(id => (typeof id === 'string' ? new ObjectId(id) : id)) }
             }).toArray();
             const campaignMap = new Map(campaigns.map(c => [c._id.toString(), c]));
+            const contactIdToObjectId = (value) => {
+                try {
+                    return typeof value === 'string' ? new ObjectId(value) : value;
+                } catch {
+                    return null;
+                }
+            };
+            const contactObjectIds = analyses
+                .map(a => contactIdToObjectId(a.contact_id))
+                .filter(Boolean);
+            const contacts = contactObjectIds.length > 0
+                ? await db.collection('contactprocessings').find(
+                    { _id: { $in: contactObjectIds } },
+                    { projection: { _id: 1, status: 1, callReceiveStatus: 1, nextRetryAt: 1, isFollowUp: 1 } }
+                ).toArray()
+                : [];
+            const contactMap = new Map(contacts.map(c => [String(c._id), c]));
 
             const contactBulkUpdates = [];
+            const contactPolicyAuditUpdates = [];
             const analysisFinalUpdates = [];
 
             for (const analysis of analyses) {
                 const { contact_id, campaign_id, analysis_data } = analysis;
                 const campaign = campaignMap.get(campaign_id?.toString());
+                const contactObjId = contactIdToObjectId(contact_id);
+                const contactSnapshot = contactObjId ? contactMap.get(String(contactObjId)) : null;
 
                 // Skip if campaign is missing or follow-up disabled
                 if (!campaign || campaign.followup !== true) {
@@ -1192,6 +1262,97 @@ export class Scheduler {
                     continue;
                 }
 
+                if (!contactObjId) {
+                    analysisFinalUpdates.push({
+                        updateOne: {
+                            filter: { _id: analysis._id },
+                            update: { $set: { followUpProcessed: true, followUpError: 'invalid_contact_id', updatedAt: new Date() } }
+                        }
+                    });
+                    continue;
+                }
+
+                if (!contactSnapshot) {
+                    analysisFinalUpdates.push({
+                        updateOne: {
+                            filter: { _id: analysis._id },
+                            update: { $set: { followUpProcessed: true, followUpError: 'contact_not_found', updatedAt: new Date() } }
+                        }
+                    });
+                    continue;
+                }
+
+                // retry_wins policy: follow-up scheduling only transitions a truly completed call.
+                // This prevents follow-up writes from overriding retry/processing states.
+                if (String(contactSnapshot.status) !== 'completed') {
+                    contactPolicyAuditUpdates.push({
+                        updateOne: {
+                            filter: { _id: contactObjId },
+                            update: {
+                                $push: {
+                                    statusHistory: {
+                                        fromStatus: String(contactSnapshot.status || ''),
+                                        toStatus: String(contactSnapshot.status || ''),
+                                        reason: 'follow-up-skipped-retry-wins',
+                                        policy: 'retry_wins',
+                                        analysisId: analysis._id,
+                                        note: 'Skipped follow-up because contact is not in completed state',
+                                        timestamp: new Date()
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    analysisFinalUpdates.push({
+                        updateOne: {
+                            filter: { _id: analysis._id },
+                            update: {
+                                $set: {
+                                    followUpProcessed: true,
+                                    followUpError: 'retry_wins_state_not_completed',
+                                    followUpSkippedBecauseStatus: String(contactSnapshot.status || ''),
+                                    updatedAt: new Date()
+                                }
+                            }
+                        }
+                    });
+                    continue;
+                }
+                if (Number(contactSnapshot.callReceiveStatus) !== 3) {
+                    contactPolicyAuditUpdates.push({
+                        updateOne: {
+                            filter: { _id: contactObjId },
+                            update: {
+                                $push: {
+                                    statusHistory: {
+                                        fromStatus: String(contactSnapshot.status || ''),
+                                        toStatus: String(contactSnapshot.status || ''),
+                                        reason: 'follow-up-skipped-retry-wins',
+                                        policy: 'retry_wins',
+                                        analysisId: analysis._id,
+                                        note: `Skipped follow-up because callReceiveStatus=${Number(contactSnapshot.callReceiveStatus || 0)} (expected 3)`,
+                                        timestamp: new Date()
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    analysisFinalUpdates.push({
+                        updateOne: {
+                            filter: { _id: analysis._id },
+                            update: {
+                                $set: {
+                                    followUpProcessed: true,
+                                    followUpError: 'retry_wins_call_not_completed',
+                                    followUpSkippedBecauseReceiveStatus: Number(contactSnapshot.callReceiveStatus || 0),
+                                    updatedAt: new Date()
+                                }
+                            }
+                        }
+                    });
+                    continue;
+                }
+
                 // Analyze timing
                 const nextAction = analysis_data?.Next_Action;
                 let scheduledTime = null;
@@ -1204,13 +1365,14 @@ export class Scheduler {
                 // Push Contact Update
                 contactBulkUpdates.push({
                     updateOne: {
-                        filter: { _id: (typeof contact_id === 'string' ? new ObjectId(contact_id) : contact_id) },
+                        filter: { _id: contactObjId, status: 'completed', callReceiveStatus: 3 },
                         update: {
                             $set: {
                                 status: 'pending',
                                 scheduledAt: scheduledTime,
                                 priority: nextAction?.Priority || 'Medium',
                                 callReceiveStatus: 0,
+                                nextRetryAt: null,
                                 retryCount: 0,
                                 isFollowUp: true,
                                 lastFollowUpAt: new Date(),
@@ -1260,6 +1422,9 @@ export class Scheduler {
             // 3. High-Speed Execution
             if (contactBulkUpdates.length > 0) {
                 await db.collection('contactprocessings').bulkWrite(contactBulkUpdates, { ordered: false });
+            }
+            if (contactPolicyAuditUpdates.length > 0) {
+                await db.collection('contactprocessings').bulkWrite(contactPolicyAuditUpdates, { ordered: false });
             }
             if (analysisFinalUpdates.length > 0) {
                 await db.collection('call_analysis').bulkWrite(analysisFinalUpdates, { ordered: false });

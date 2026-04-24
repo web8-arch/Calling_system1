@@ -7,6 +7,7 @@ import { getRedis } from './redis.js';
 export class ConcurrencyGuard {
   constructor() {
     this.redis = getRedis();
+    this.slotTtlSeconds = Math.max(60, parseInt(process.env.CONCURRENCY_SLOT_TTL_SECONDS || '1200', 10));
   }
 
   /**
@@ -28,15 +29,23 @@ export class ConcurrencyGuard {
       if campaignCount < tonumber(ARGV[1]) and userCount < tonumber(ARGV[2]) then
         redis.call('INCR', KEYS[1])
         redis.call('INCR', KEYS[2])
-        redis.call('EXPIRE', KEYS[1], 300)
-        redis.call('EXPIRE', KEYS[2], 300)
+        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+        redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
         return 1
       else
         return 0
       end
     `;
 
-    const result = await this.redis.eval(luaScript, 2, campaignKey, userKey, campaignLimit, userLimit);
+    const result = await this.redis.eval(
+      luaScript,
+      2,
+      campaignKey,
+      userKey,
+      campaignLimit,
+      userLimit,
+      this.slotTtlSeconds
+    );
     return result === 1;
   }
 
@@ -60,6 +69,24 @@ export class ConcurrencyGuard {
     `;
 
     await this.redis.eval(luaScript, 2, campaignKey, userKey);
+  }
+
+  /**
+   * Extends TTL for in-use slot counters (lease refresh / heartbeat).
+   */
+  async touchSlot(campaignId, userId) {
+    const campaignKey = `concurrency:campaign:${campaignId}`;
+    const userKey = `concurrency:user:${userId}`;
+    const luaScript = `
+      if tonumber(redis.call('GET', KEYS[1]) or '0') > 0 then
+        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+      end
+      if tonumber(redis.call('GET', KEYS[2]) or '0') > 0 then
+        redis.call('EXPIRE', KEYS[2], tonumber(ARGV[1]))
+      end
+      return 1
+    `;
+    await this.redis.eval(luaScript, 2, campaignKey, userKey, this.slotTtlSeconds);
   }
 }
 

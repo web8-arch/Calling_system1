@@ -18,6 +18,12 @@ export async function getDb() {
     return db;
 }
 
+export async function getMongoClient() {
+    if (client) return client;
+    await getDb();
+    return client;
+}
+
 export async function closeDb() {
     if (client) {
         await client.close();

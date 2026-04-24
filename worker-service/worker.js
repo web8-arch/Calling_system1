@@ -2,6 +2,7 @@ import { Worker } from 'bullmq';
 import {
     getRedis,
     getDb,
+    getMongoClient,
     concurrencyGuard,
     isWithinBusinessHours,
     isCampaignBlockedByTestCall,
@@ -20,6 +21,9 @@ const ANALYSIS_API_RETRY_MS = parseInt(process.env.ANALYSIS_API_RETRY_MS || '300
 const ANALYSIS_API_INITIAL_DELAY_MS = parseInt(process.env.ANALYSIS_API_INITIAL_DELAY_MS || '2500', 10);
 const CALL_CREDIT_MAX_ATTEMPTS = parseInt(process.env.CALL_CREDIT_MAX_ATTEMPTS || '5', 10);
 const CALL_CREDIT_RETRY_MS = parseInt(process.env.CALL_CREDIT_RETRY_MS || '3000', 10);
+const CALL_COMPLETION_CONFIRM_MS = parseInt(process.env.CALL_COMPLETION_CONFIRM_MS || '6000', 10);
+const BILLING_HEALTH_LOG_INTERVAL_MS = parseInt(process.env.BILLING_HEALTH_LOG_INTERVAL_MS || '300000', 10);
+const SLOT_HEARTBEAT_INTERVAL_MS = Math.max(2000, parseInt(process.env.SLOT_HEARTBEAT_INTERVAL_MS || '15000', 10));
 
 /**
  * Billable duration (seconds) from CallLog events. Prefers call_answered + call_hangup timestamps, then cdr_push.Duration when ANSWER.
@@ -76,6 +80,71 @@ function parseEndTimeParts(endTime) {
         if (dt.isValid) return { hour: dt.hour, minute: dt.minute, second: dt.second };
     }
     return null;
+}
+
+/** Maps Undici / system codes from a failed Call API fetch to operator-friendly messages (no extra I/O). */
+const CALL_API_FETCH_MESSAGES = {
+    // Node libuv / system
+    ECONNREFUSED: 'API connection refused (nothing listening on host/port or service down)',
+    ETIMEDOUT: 'API connection timed out',
+    ENOTFOUND: 'API host could not be resolved (DNS)',
+    EAI_AGAIN: 'API host lookup failed temporarily (DNS)',
+    ECONNRESET: 'API closed the connection unexpectedly',
+    EPIPE: 'API connection broken while sending request',
+    ENETUNREACH: 'Network unreachable (cannot route to API host)',
+    EHOSTUNREACH: 'API host unreachable',
+    EADDRINUSE: 'Local address in use (outbound socket conflict)',
+    CERT_HAS_EXPIRED: 'API TLS certificate expired',
+    UNABLE_TO_VERIFY_LEAF_SIGNATURE: 'API TLS certificate could not be verified',
+    // Undici (Node fetch)
+    UND_ERR_CONNECT_TIMEOUT: 'API connection timed out (connect phase)',
+    UND_ERR_HEADERS_TIMEOUT: 'API response headers timed out',
+    UND_ERR_BODY_TIMEOUT: 'API response body timed out',
+    UND_ERR_SOCKET: 'API socket error',
+    UND_ERR_ABORTED: 'API request aborted',
+    UND_ERR_NOT_SUPPORTED: 'API request not supported'
+};
+
+/**
+ * Best-effort errno / Undici code from fetch failure (nested cause / AggregateError).
+ */
+function extractNodeErrnoCode(err, depth = 0) {
+    if (!err || depth > 10) return undefined;
+
+    const code = err.code;
+    if (typeof code === 'string' && code.length > 0) {
+        if (code.startsWith('E') && code.length >= 4) return code;
+        if (code.startsWith('UND_ERR')) return code;
+    }
+
+    if (err.cause) {
+        const fromCause = extractNodeErrnoCode(err.cause, depth + 1);
+        if (fromCause) return fromCause;
+    }
+    if (Array.isArray(err.errors)) {
+        for (const e of err.errors) {
+            const c = extractNodeErrnoCode(e, depth + 1);
+            if (c) return c;
+        }
+    }
+    return undefined;
+}
+
+/**
+ * User- and DB-friendly message for transport-level fetch failures to the Call API.
+ */
+function messageForCallApiFetchFailure(err) {
+    const code = extractNodeErrnoCode(err);
+    if (code && CALL_API_FETCH_MESSAGES[code]) return CALL_API_FETCH_MESSAGES[code];
+    if (code) return `Call API request failed (${code})`;
+
+    const causeMsg = err?.cause && typeof err.cause.message === 'string' ? err.cause.message.trim() : '';
+    if (causeMsg) return `Call API error: ${causeMsg}`;
+
+    const top = typeof err?.message === 'string' ? err.message.trim() : '';
+    if (top && top !== 'fetch failed') return `Call API error: ${top}`;
+
+    return 'Call API request failed (network error)';
 }
 
 function getCampaignEndDateTime(campaign) {
@@ -170,6 +239,19 @@ async function shouldIgnoreEndWindow({ campaign, metadata, db }) {
 export class CallWorker {
     constructor() {
         this.postCallQueue = createPostCallQueue();
+        this.billingIndexesEnsured = false;
+        this.billingHealth = {
+            deductedCalls: 0,
+            deductedAmount: 0,
+            alreadyBilledSkips: 0,
+            insufficientCreditSkips: 0,
+            missingIdentitySkips: 0,
+            transactionUnavailableSkips: 0,
+            transactionErrors: 0,
+        };
+        this.billingHealthTimer = setInterval(() => {
+            this.logBillingHealthSummaryAndReset();
+        }, BILLING_HEALTH_LOG_INTERVAL_MS);
 
         this.worker = new Worker(queueName, this.processJob.bind(this), {
             connection: getRedis(),
@@ -245,6 +327,10 @@ export class CallWorker {
     }
 
     async close() {
+        if (this.billingHealthTimer) {
+            clearInterval(this.billingHealthTimer);
+            this.billingHealthTimer = null;
+        }
         await Promise.all([
             this.worker.close(),
             this.postCallWorker.close(),
@@ -281,6 +367,80 @@ export class CallWorker {
         }
 
         return roundSix(kbRatePerMinute);
+    }
+
+    async ensureBillingIndexes(db) {
+        if (this.billingIndexesEnsured) return;
+        await db.collection('credittransactions').createIndex(
+            { type: 1, 'reference.billingKey': 1 },
+            {
+                unique: true,
+                partialFilterExpression: {
+                    type: 'call_deduction',
+                    'reference.billingKey': { $exists: true, $type: 'string' }
+                },
+                background: true
+            }
+        );
+        this.billingIndexesEnsured = true;
+    }
+
+    async verifyBillingReadiness() {
+        try {
+            const db = await getDb();
+            await this.ensureBillingIndexes(db);
+
+            const indexes = await db.collection('credittransactions').indexes();
+            const hasBillingKeyIndex = indexes.some((idx) => {
+                const key = idx?.key || {};
+                return key.type === 1 && key['reference.billingKey'] === 1 && idx.unique === true;
+            });
+            if (hasBillingKeyIndex) {
+                console.log('✅ [Worker] Billing idempotency index ready (credittransactions.type + reference.billingKey unique)');
+            } else {
+                console.error('❌ [Worker] Billing idempotency index missing. Duplicate deductions risk is high.');
+            }
+
+            const mongoClient = await getMongoClient();
+            const hello = await mongoClient.db().admin().command({ hello: 1 });
+            const supportsTransactions = Boolean(hello?.setName || hello?.msg === 'isdbgrid');
+            if (!supportsTransactions) {
+                console.warn(
+                    '⚠️ [Worker] MongoDB is neither replica-set nor mongos. Billing transactions may be unavailable; deduction will fail-safe.'
+                );
+            } else {
+                const topo = hello?.setName ? `replica set ${hello.setName}` : 'mongos cluster';
+                console.log(`✅ [Worker] Mongo topology supports transactions (${topo})`);
+            }
+        } catch (err) {
+            console.error(`❌ [Worker] Billing readiness check failed: ${err?.message || err}`);
+        }
+    }
+
+    logBillingHealthSummaryAndReset() {
+        const s = this.billingHealth;
+        const touched = Object.values(s).some((v) => Number(v) > 0);
+        if (touched) {
+            console.log(
+                `📊 [Worker] Billing health (last ${Math.round(BILLING_HEALTH_LOG_INTERVAL_MS / 60000)}m): ` +
+                `deductedCalls=${s.deductedCalls}, ` +
+                `deductedAmount=${s.deductedAmount.toFixed(6)}, ` +
+                `alreadyBilledSkips=${s.alreadyBilledSkips}, ` +
+                `insufficientCreditSkips=${s.insufficientCreditSkips}, ` +
+                `missingIdentitySkips=${s.missingIdentitySkips}, ` +
+                `transactionUnavailableSkips=${s.transactionUnavailableSkips}, ` +
+                `transactionErrors=${s.transactionErrors}`
+            );
+        }
+        this.billingHealth = {
+            deductedCalls: 0,
+            deductedAmount: 0,
+            alreadyBilledSkips: 0,
+            insufficientCreditSkips: 0,
+            missingIdentitySkips: 0,
+            transactionUnavailableSkips: 0,
+            transactionErrors: 0,
+        };
     }
 
     /**
@@ -400,7 +560,7 @@ export class CallWorker {
 
         // 2. Acquire Distributed Concurrency Slot (Wait for availability)
         let hasSlot = false;
-        const checkInterval = 500; // Reduced to 500ms for faster acquisition
+        const initialCheckInterval = 500;
         const startTime = Date.now();
         const maxWaitTime = 3600000; // 1 hour safety timeout
 
@@ -429,21 +589,41 @@ export class CallWorker {
                     return;
                 }
 
-                // Wait before next check
-                await new Promise(resolve => setTimeout(resolve, checkInterval));
+                // Exponential backoff + jitter to avoid control-plane thundering herd.
+                const waitedMs = Date.now() - startTime;
+                const backoffFactor = Math.min(20, Math.floor(waitedMs / 5000));
+                const nextWait = Math.min(10000, Math.floor(initialCheckInterval * Math.pow(1.25, backoffFactor)));
+                const jitter = Math.floor(Math.random() * 250);
+                await new Promise(resolve => setTimeout(resolve, nextWait + jitter));
             }
         }
 
         let shouldReleaseSlot = true; // Declare here so it is accessible in finally{}
         let currentlyHoldingSlot = false;
         let attemptStartedAt = 0; // Set right after executeCall; used for nextRetryAt so delay is from attempt start, not poll end
+        let lastSlotHeartbeatAt = 0;
+        const heartbeatSlot = async (force = false) => {
+            if (!currentlyHoldingSlot) return;
+            const now = Date.now();
+            if (!force && now - lastSlotHeartbeatAt < SLOT_HEARTBEAT_INTERVAL_MS) return;
+            await concurrencyGuard.touchSlot(campaignId, userId);
+            lastSlotHeartbeatAt = now;
+        };
 
         try {
             // 3. Update Status to 'processing'
-            await db.collection('contactprocessings').updateOne(
-                { _id: contactObjId },
-                { $set: { status: 'processing', lastAttemptAt: new Date() } }
+            const processingTransition = await db.collection('contactprocessings').updateOne(
+                { _id: contactObjId, status: { $nin: ['completed', 'failed'] } },
+                { $set: { status: 'processing', lastAttemptAt: new Date(), updatedAt: new Date() } }
             );
+
+            if (processingTransition.matchedCount === 0) {
+                const alreadyHandledContact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
+                console.log(
+                    `⏩ [Worker] Skipping contact ${contactId}: already in terminal state (${alreadyHandledContact?.status || 'unknown'}).`
+                );
+                return;
+            }
 
             // 4. Fetch latest contact data again to ensure consistent retry logic after slot acquisition
             const currentContact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
@@ -457,6 +637,7 @@ export class CallWorker {
             const result = await this.executeCall(job.data);
             attemptStartedAt = Date.now(); // Capture once; used for nextRetryAt and callAttempts timestamp (retry delay from attempt start)
             currentlyHoldingSlot = true; // Still holding the slot from the initiation acquisition
+            await heartbeatSlot(true);
 
             // 6. Polling Logic: Wait for the API to register the call (Status 1, 2, or 3)
             console.log(`⏳ [Worker] Waiting for call registration for ${contactId}...`);
@@ -504,13 +685,18 @@ export class CallWorker {
                                 break;
                             }
 
-                            await new Promise(resolve => setTimeout(resolve, 2000));
+                            const waitedMs = Date.now() - startTime;
+                            const backoffFactor = Math.min(20, Math.floor(waitedMs / 5000));
+                            const nextWait = Math.min(10000, Math.floor(2000 * Math.pow(1.15, backoffFactor)));
+                            const jitter = Math.floor(Math.random() * 300);
+                            await new Promise(resolve => setTimeout(resolve, nextWait + jitter));
                         }
                     }
 
                     if (reAcquired) {
                         currentlyHoldingSlot = true;
                         shouldReleaseSlot = true;
+                        await heartbeatSlot(true);
 
                         // Now wait for completion
                         console.log(`📡 [Worker] Slot held for ${contactId}. Waiting for completion...`);
@@ -521,6 +707,7 @@ export class CallWorker {
             } else if (callStatus === 2) {
                 // RUNNING immediately: Keep the slot and wait for completion
                 console.log(`📡 [Worker] Call ${contactId} is already RUNNING. Keeping slot and waiting for completion...`);
+                await heartbeatSlot();
                 updatedContact = await this.pollStatus(contactId, [3], 600000, 2000);
                 callStatus = parseInt(updatedContact?.callReceiveStatus) || 0;
             } else if (callStatus === 3) {
@@ -535,12 +722,46 @@ export class CallWorker {
                 dbStatus: updatedContact?.status
             });
 
+            // Re-read the latest DB state before final decision to avoid stale/local poll values
+            // marking contacts as completed when webhook updates are still in-flight.
+            const latestContactForDecision = await db.collection('contactprocessings').findOne({ _id: contactObjId });
+            const persistedFinalStatus = parseInt(latestContactForDecision?.callReceiveStatus);
+            if (Number.isFinite(persistedFinalStatus) && callStatus === 3 && persistedFinalStatus !== 3) {
+                console.warn(
+                    `⚠️ [Worker] Contact ${contactId} had transient COMPLETED state, but latest DB status is ${persistedFinalStatus}. Falling back to latest status for retry/follow-up decision.`
+                );
+                callStatus = persistedFinalStatus;
+            }
+
             console.log(`🔍 [Worker] Final Status for ${contactId}: DB=${callStatus}`);
 
-            const maxRetries = metadata.maxRetryAttempts || 3;
+            const configuredMaxRetries = Number(metadata.maxRetryAttempts);
+            const maxRetries = Number.isFinite(configuredMaxRetries)
+                ? Math.max(0, configuredMaxRetries)
+                : 3;
             const retryDelayMinutes = metadata.retryDelayMinutes || 30;
-            const currentRetryCount = currentContact.retryCount || 0;
-            const currentAttempts = (currentContact.callAttempts?.length || 0) + 1;
+            const decisionContact = latestContactForDecision || currentContact;
+            const currentRetryCount = decisionContact.retryCount || 0;
+            const currentAttempts = (decisionContact.callAttempts?.length || 0) + 1;
+
+            // Avoid transient false-complete races:
+            // wait briefly and reconfirm status=3 before terminal "completed" write.
+            if (callStatus === 3 && CALL_COMPLETION_CONFIRM_MS > 0) {
+                await new Promise(resolve => setTimeout(resolve, CALL_COMPLETION_CONFIRM_MS));
+                const confirmedContact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
+                const confirmedStatus = parseInt(confirmedContact?.callReceiveStatus) || 0;
+                if (confirmedStatus !== 3) {
+                    console.warn(
+                        `⚠️ [Worker] Completion check for ${contactId} flipped from 3 to ${confirmedStatus} after ${CALL_COMPLETION_CONFIRM_MS}ms; continuing with retry/fail path.`
+                    );
+                    callStatus = confirmedStatus;
+                    await job.updateData({
+                        ...job.data,
+                        callReceiveStatus: confirmedStatus,
+                        dbStatus: confirmedContact?.status
+                    });
+                }
+            }
 
             if (callStatus === 3) {
                 // COMPLETED: Success, release slot.
@@ -552,7 +773,7 @@ export class CallWorker {
                     {
                         $set: {
                             status: 'completed',
-                            callReceiveStatus: callStatus,
+                            callReceiveStatus: 3,
                             updatedAt: new Date()
                         },
                         $push: {
@@ -587,32 +808,110 @@ export class CallWorker {
                 }
             } else {
                 // FAILED (0) or NOT RECEIVED (1): Persist immediately; nextRetryAt from attempt start so delay is not inflated by polling
-                const isRetryable = currentRetryCount + 1 < maxRetries;
-                const nextStatus = isRetryable ? 'retry' : 'failed';
+                // retryCount tracks failed attempts already consumed; allow retries until it reaches maxRetries
+                const isRetryable = currentRetryCount < maxRetries;
                 const baseTime = attemptStartedAt > 0 ? attemptStartedAt : Date.now();
+                const shouldScheduleFallbackFollowUp =
+                    !isRetryable &&
+                    callStatus === 1 &&
+                    campaign?.followup === true &&
+                    !decisionContact?.isFollowUp;
+                const nextStatus = shouldScheduleFallbackFollowUp
+                    ? 'pending'
+                    : (isRetryable ? 'retry' : 'failed');
                 const nextRetryAt = isRetryable ? new Date(baseTime + retryDelayMinutes * 60000) : null;
+                const followUpScheduledAt = shouldScheduleFallbackFollowUp
+                    ? new Date(baseTime + retryDelayMinutes * 60000)
+                    : null;
                 const attemptTimestamp = new Date(attemptStartedAt > 0 ? attemptStartedAt : Date.now());
 
-                await db.collection('contactprocessings').updateOne(
-                    { _id: contactObjId },
-                    {
-                        $set: {
-                            status: nextStatus,
-                            callReceiveStatus: callStatus,
-                            nextRetryAt,
-                            updatedAt: new Date()
-                        },
-                        $inc: { retryCount: 1 },
-                        $push: {
-                            callAttempts: {
-                                attempt: currentAttempts,
-                                timestamp: attemptTimestamp,
-                                status: nextStatus,
-                                message: callStatus === 1 ? 'Not Received' : 'API Attempt Failed'
-                            }
+                const updateDoc = {
+                    $set: {
+                        status: nextStatus,
+                        callReceiveStatus: callStatus,
+                        nextRetryAt,
+                        updatedAt: new Date()
+                    },
+                    $push: {
+                        callAttempts: {
+                            attempt: currentAttempts,
+                            timestamp: attemptTimestamp,
+                            status: shouldScheduleFallbackFollowUp ? 'follow-up' : nextStatus,
+                            message: shouldScheduleFallbackFollowUp
+                                ? 'Not Received - Scheduled Follow-up'
+                                : (callStatus === 1 ? 'Not Received' : 'API Attempt Failed')
                         }
                     }
+                };
+
+                if (shouldScheduleFallbackFollowUp) {
+                    updateDoc.$set.scheduledAt = followUpScheduledAt;
+                    updateDoc.$set.isFollowUp = true;
+                    updateDoc.$set.lastFollowUpAt = new Date();
+                    updateDoc.$set.retryCount = 0;
+                } else {
+                    updateDoc.$inc = { retryCount: 1 };
+                }
+
+                const retryWriteResult = await db.collection('contactprocessings').updateOne(
+                    {
+                        _id: contactObjId,
+                        callReceiveStatus: { $ne: 3 },
+                        status: 'processing',
+                    },
+                    updateDoc
                 );
+
+                if (retryWriteResult.matchedCount === 0) {
+                    // Another webhook/update marked this contact as completed while we were deciding.
+                    const lateFinalContact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
+                    const lateStatus = parseInt(lateFinalContact?.callReceiveStatus) || 0;
+
+                    if (lateStatus === 3) {
+                        console.log(`✅ [Worker] Contact ${contactId} completed during retry write. Finalizing as completed.`);
+
+                        await db.collection('contactprocessings').updateOne(
+                            { _id: contactObjId },
+                            {
+                                $set: {
+                                    status: 'completed',
+                                    callReceiveStatus: 3,
+                                    updatedAt: new Date()
+                                },
+                                $push: {
+                                    callAttempts: {
+                                        attempt: currentAttempts,
+                                        timestamp: new Date(),
+                                        status: 'completed',
+                                        message: 'Success (late confirmation)'
+                                    }
+                                }
+                            }
+                        );
+
+                        if (currentlyHoldingSlot) {
+                            await concurrencyGuard.releaseSlot(campaignId, userId);
+                            currentlyHoldingSlot = false;
+                        }
+                        shouldReleaseSlot = false;
+
+                        try {
+                            await this.enqueuePostCallJob(job.data, result);
+                        } catch (triggerError) {
+                            console.error(`⚠️ [Worker] Post-call enqueue failed after late completion, running inline:`, triggerError.message);
+                            try {
+                                await new Promise(r => setTimeout(r, POST_CALL_DELAY_MS));
+                                await this.triggerPostCallActions(job.data, result, metadata, lateFinalContact || decisionContact);
+                            } catch (inlineErr) {
+                                console.error(`⚠️ [Worker] Inline post-call failed after late completion:`, inlineErr.message);
+                            }
+                        }
+
+                        return result;
+                    }
+
+                    console.warn(`⚠️ [Worker] Retry/fail write skipped for ${contactId}; latest status=${lateFinalContact?.status}, callReceiveStatus=${lateStatus}.`);
+                }
 
                 // RELEASE SLOT if holding
                 if (currentlyHoldingSlot) {
@@ -621,7 +920,11 @@ export class CallWorker {
                 }
                 shouldReleaseSlot = false;
 
-                console.log(`🔁 [Worker] Call ${contactId} FAILED/RETRY (Status: ${callStatus}). Releasing slot.`);
+                if (shouldScheduleFallbackFollowUp) {
+                    console.log(`🔄 [Worker] Call ${contactId} remained NOT RECEIVED after retries. Scheduled one follow-up at ${followUpScheduledAt?.toISOString?.()}.`);
+                } else {
+                    console.log(`🔁 [Worker] Call ${contactId} FAILED/RETRY (Status: ${callStatus}). Releasing slot.`);
+                }
             }
 
             return result;
@@ -632,12 +935,15 @@ export class CallWorker {
             const db = await getDb();
             const contact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
             const campaignForError = await db.collection('campaigns').findOne({ _id: new ObjectId(campaignId) });
-            const maxRetries = metadata.maxRetryAttempts || 3;
+            const configuredMaxRetries = Number(metadata.maxRetryAttempts);
+            const maxRetries = Number.isFinite(configuredMaxRetries)
+                ? Math.max(0, configuredMaxRetries)
+                : 3;
             const retryDelayMinutes = metadata.retryDelayMinutes || 30;
             const currentRetryCount = contact?.retryCount || 0;
             const currentAttempts = (contact?.callAttempts?.length || 0) + 1;
 
-            const isRetryable = currentRetryCount + 1 < maxRetries;
+            const isRetryable = currentRetryCount < maxRetries;
             const status = isRetryable ? 'retry' : 'failed';
             const nextRetryAt = isRetryable ? new Date(Date.now() + retryDelayMinutes * 60000) : null;
 
@@ -670,7 +976,10 @@ export class CallWorker {
                 severity: 'error',
                 errorMessage: error.message,
                 errorStack: error.stack,
-                errorCode: String(error.message || '').includes('fetch failed') ? 'FETCH_FAILED' : undefined,
+                errorCode:
+                    extractNodeErrnoCode(error) ||
+                    (String(error.message || '').startsWith('API_CALL_FAILED:') ? 'API_HTTP_ERROR' : undefined) ||
+                    (/^(API connection|Call API)/.test(String(error.message || '')) ? 'CALL_API_TRANSPORT' : undefined),
                 userId: userId,
                 userEmail: campaignForError?.createdBy,
                 campaignId,
@@ -713,14 +1022,24 @@ export class CallWorker {
 
         console.log(`📞 [Worker] Making ${tier} call to ${data.phone || data.contactId} via API (${url})...`);
 
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-API-Key': config.api.callingKey
-            },
-            body: JSON.stringify(payload)
-        });
+        let response;
+        try {
+            response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-API-Key': config.api.callingKey
+                },
+                body: JSON.stringify(payload)
+            });
+        } catch (fetchErr) {
+            const code = extractNodeErrnoCode(fetchErr);
+            const msg = messageForCallApiFetchFailure(fetchErr);
+            console.warn(
+                `⚠️ [Worker] Call API fetch failed${code ? ` [${code}]` : ''}: ${fetchErr?.cause?.message || fetchErr?.message || fetchErr}`
+            );
+            throw new Error(msg, { cause: fetchErr });
+        }
 
         if (!response.ok) {
             const errorText = await response.text();
@@ -928,27 +1247,6 @@ export class CallWorker {
             `💰 [Worker] Processing credit deduction for Call ID: ${callId}, Lead ID: ${leadId ?? 'N/A'} (Duration: ${duration}s, billing attempts: ${billingAttemptsUsed}/${CALL_CREDIT_MAX_ATTEMPTS})...`
         );
 
-        // Idempotency: BullMQ retries must not double-deduct for same lead_id/call_id
-        if (leadId != null || (callId && !String(callId).startsWith('call_'))) {
-            const dedupeOr = [];
-            if (leadId != null) {
-                dedupeOr.push({ 'reference.leadId': leadId });
-                dedupeOr.push({ 'reference.leadId': String(leadId) });
-            }
-            if (callId && !String(callId).startsWith('call_')) {
-                dedupeOr.push({ 'reference.callId': callId });
-                dedupeOr.push({ 'reference.callId': String(callId) });
-            }
-            const alreadyBilled = await db.collection('credittransactions').findOne({
-                type: 'call_deduction',
-                $or: dedupeOr
-            });
-            if (alreadyBilled) {
-                console.log(`ℹ️ [Worker] Credit already recorded for call ${callId} / lead ${leadId ?? 'N/A'}, skipping duplicate post-call billing.`);
-                return;
-            }
-        }
-
         try {
             // 1. Fetch Campaign and User
             const campaign = await db.collection('campaigns').findOne({ _id: new ObjectId(campaignId) });
@@ -1011,6 +1309,34 @@ export class CallWorker {
             console.log(
                 `💳 [Worker] Billing rates — plan: ${ratePerMinute}/min, kb: ${kbRatePerMinute}/min, total: ${totalRatePerMinute}/min`
             );
+            const stableCallId =
+                callId && !String(callId).startsWith('call_')
+                    ? String(callId)
+                    : null;
+            const stableLeadId = leadId != null ? String(leadId) : null;
+            const billingKey = stableCallId
+                ? `${String(campaign._id)}:call:${stableCallId}`
+                : stableLeadId
+                    ? `${String(campaign._id)}:lead:${stableLeadId}`
+                    : null;
+            if (!billingKey) {
+                console.warn(`⚠️ [Worker] Missing stable billing identity for contact ${contactId}. Skipping deduction to prevent duplicate billing risk.`);
+                this.billingHealth.missingIdentitySkips += 1;
+                if (callLogUpdateFilter) {
+                    await db.collection('CallLogs').updateOne(
+                        callLogUpdateFilter,
+                        {
+                            $set: {
+                                creditsDeducted: false,
+                                creditDeductionError: 'missing_billing_identity',
+                                processedAt: new Date(),
+                                updatedAt: new Date()
+                            }
+                        }
+                    );
+                }
+                return;
+            }
 
             // 3. Billing Brackets and Cost Calculation
             const durationInSeconds = duration; // Already in seconds from logic above
@@ -1038,11 +1364,154 @@ export class CallWorker {
                 partialMinuteFraction = (bracket?.percentOfRatePerMinute ?? 100) / 100;
             }
 
-            const cost = parseFloat(((fullMinutes * totalRatePerMinute) + (partialMinuteFraction * totalRatePerMinute)).toFixed(6));
+            // const cost = parseFloat(((fullMinutes * totalRatePerMinute) + (partialMinuteFraction * totalRatePerMinute)).toFixed(6));
+            const cost = parseFloat(((fullMinutes * ratePerMinute) + (partialMinuteFraction * ratePerMinute)).toFixed(6));
+            const creditTxCol = db.collection('credittransactions');
+            await this.ensureBillingIndexes(db);
 
-            // 4. Atomic Credit Deduction
-            if (user.credits < cost) {
-                console.warn(`⚠️ [Worker] Insufficient credits for ${user.email}. Cost: ${cost}, Balance: ${user.credits}`);
+            let alreadyBilled = false;
+            let insufficientCredits = false;
+            let callLogMatchedInTx = null;
+            const mongoClient = await getMongoClient();
+            const session = mongoClient.startSession();
+
+            try {
+                await session.withTransaction(async () => {
+                    const existingTx = await creditTxCol.findOne(
+                        {
+                            type: 'call_deduction',
+                            'reference.billingKey': billingKey,
+                        },
+                        { session, projection: { _id: 1 } }
+                    );
+                    if (existingTx) {
+                        alreadyBilled = true;
+                        return;
+                    }
+
+                    const userFresh = await db.collection('users').findOne(
+                        { _id: user._id },
+                        { session, projection: { _id: 1, email: 1, credits: 1 } }
+                    );
+                    if (!userFresh) throw new Error(`User ${user._id} not found during billing transaction`);
+
+                    if ((userFresh.credits || 0) < cost) {
+                        insufficientCredits = true;
+                        return;
+                    }
+
+                    const deductionResult = await db.collection('users').updateOne(
+                        { _id: user._id, credits: { $gte: cost } },
+                        {
+                            $inc: { credits: -cost },
+                            $set: { updatedAt: new Date() }
+                        },
+                        { session }
+                    );
+
+                    if (deductionResult.modifiedCount === 0 && cost > 0) {
+                        throw new Error('Credit deduction failed (likely race condition or insufficient funds)');
+                    }
+
+                    const userAfter = await db.collection('users').findOne(
+                        { _id: user._id },
+                        { session, projection: { credits: 1 } }
+                    );
+
+                    await creditTxCol.insertOne(
+                        {
+                            userId: user._id,
+                            userEmail: user.email,
+                            type: 'call_deduction',
+                            amount: -cost,
+                            balanceAfter: parseFloat((userAfter?.credits || 0).toFixed(6)),
+                            description: 'Call Usage',
+                            reference: {
+                                campaignId: campaign._id,
+                                campaignName: campaign.name || campaign.campaignName,
+                                callDuration: durationInSeconds,
+                                callId,
+                                leadId,
+                                billingKey,
+                            },
+                            createdAt: new Date(),
+                            updatedAt: new Date()
+                        },
+                        { session }
+                    );
+
+                    const today = new Date().toISOString().split('T')[0];
+                    await db.collection('analytics').updateOne(
+                        {
+                            userId: user.email,
+                            campaignId: campaign._id.toString(),
+                            date: today
+                        },
+                        {
+                            $inc: {
+                                totalMinutes: parseFloat((durationInSeconds / 60).toFixed(4)),
+                                totalCalls: 1,
+                                connectedCalls: duration > 0 ? 1 : 0
+                            },
+                            $set: { updatedAt: new Date() }
+                        },
+                        { upsert: true, session }
+                    );
+
+                    if (callLogUpdateFilter) {
+                        const logUpdate = await db.collection('CallLogs').updateOne(
+                            callLogUpdateFilter,
+                            {
+                                $set: {
+                                    creditsDeducted: true,
+                                    creditsDeductedAmount: cost,
+                                    creditDeductionError: null,
+                                    updatedAt: new Date()
+                                }
+                            },
+                            { session }
+                        );
+                        callLogMatchedInTx = logUpdate.matchedCount;
+                    }
+                });
+            } catch (txErr) {
+                const msg = String(txErr?.message || '');
+                const unsupportedTx =
+                    msg.includes('Transaction numbers are only allowed on a replica set') ||
+                    msg.includes('This MongoDB deployment does not support retryable writes');
+                if (unsupportedTx) {
+                    console.error('❌ [Worker] Billing transaction unavailable (MongoDB deployment lacks transaction support). Skipping deduction for safety.');
+                    this.billingHealth.transactionUnavailableSkips += 1;
+                    if (callLogUpdateFilter) {
+                        await db.collection('CallLogs').updateOne(
+                            callLogUpdateFilter,
+                            {
+                                $set: {
+                                    creditsDeducted: false,
+                                    creditDeductionError: 'transactions_unavailable',
+                                    processedAt: new Date(),
+                                    updatedAt: new Date()
+                                }
+                            }
+                        );
+                    }
+                    return;
+                }
+                this.billingHealth.transactionErrors += 1;
+                throw txErr;
+            } finally {
+                await session.endSession();
+            }
+
+            if (alreadyBilled) {
+                console.log(`ℹ️ [Worker] Credit already recorded for billingKey=${billingKey}; skipping duplicate post-call billing.`);
+                this.billingHealth.alreadyBilledSkips += 1;
+                return;
+            }
+
+            if (insufficientCredits) {
+                console.warn(`⚠️ [Worker] Insufficient credits for ${user.email}. Cost: ${cost}`);
+                this.billingHealth.insufficientCreditSkips += 1;
                 if (callLogUpdateFilter) {
                     const logUpdate = await db.collection('CallLogs').updateOne(
                         callLogUpdateFilter,
@@ -1133,59 +1602,63 @@ export class CallWorker {
                 if (logUpdate.matchedCount === 0) {
                     console.warn(`⚠️ [Worker] No CallLog matched for creditsDeducted update (callId=${callId}, leadId=${leadId ?? 'N/A'})`);
                 }
-            }
+                if (callLogUpdateFilter && callLogMatchedInTx === 0) {
+                    console.warn(`⚠️ [Worker] No CallLog matched for creditsDeducted update (callId=${callId}, leadId=${leadId ?? 'N/A'})`);
+                }
+                this.billingHealth.deductedCalls += 1;
+                this.billingHealth.deductedAmount += Number(cost || 0);
 
-            console.log(
-                `✅ [Worker] Post-call actions completed for ${callId}. Cost: ${cost} (billing attempts used: ${billingAttemptsUsed}/${CALL_CREDIT_MAX_ATTEMPTS})`
-            );
+                console.log(
+                    `✅ [Worker] Post-call actions completed for ${callId}. Cost: ${cost} (billing attempts used: ${billingAttemptsUsed}/${CALL_CREDIT_MAX_ATTEMPTS})`
+                );
 
-            // 8. Trigger Call Analysis API (retries: indexing often lags a few seconds after call end)
-            if (callId && !String(callId).startsWith('call_')) {
-                try {
-                    // Give transcript/turns pipeline a brief head start before first analysis request.
-                    if (ANALYSIS_API_INITIAL_DELAY_MS > 0) {
-                        await new Promise(r => setTimeout(r, ANALYSIS_API_INITIAL_DELAY_MS));
-                    }
+                // 8. Trigger Call Analysis API (retries: indexing often lags a few seconds after call end)
+                if (callId && !String(callId).startsWith('call_')) {
+                    try {
+                        // Give transcript/turns pipeline a brief head start before first analysis request.
+                        if (ANALYSIS_API_INITIAL_DELAY_MS > 0) {
+                            await new Promise(r => setTimeout(r, ANALYSIS_API_INITIAL_DELAY_MS));
+                        }
 
-                    // ANALYSIS_API_URL can be base (http://host:5000) or prefix (http://host:5000/analyze/call)
-                    const rawAnalysis = (config.analysis?.apiUrl || 'http://72.60.221.48:5000').replace(/\/$/, '');
-                    const analysisUrl = rawAnalysis.includes('/analyze/call')
-                        ? `${rawAnalysis}/${encodeURIComponent(String(callId))}`
-                        : `${rawAnalysis}/analyze/call/${encodeURIComponent(String(callId))}`;
+                        // ANALYSIS_API_URL can be base (http://host:5000) or prefix (http://host:5000/analyze/call)
+                        const rawAnalysis = (config.analysis?.apiUrl || 'http://72.60.221.48:5000').replace(/\/$/, '');
+                        const analysisUrl = rawAnalysis.includes('/analyze/call')
+                            ? `${rawAnalysis}/${encodeURIComponent(String(callId))}`
+                            : `${rawAnalysis}/analyze/call/${encodeURIComponent(String(callId))}`;
 
-                    for (let attempt = 1; attempt <= ANALYSIS_API_MAX_ATTEMPTS; attempt++) {
-                        console.log(`🧠 [Worker] Triggering Analysis API for Call ID: ${callId} (attempt ${attempt}/${ANALYSIS_API_MAX_ATTEMPTS})...`);
-                        const analysisResponse = await fetch(analysisUrl, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' }
-                        });
+                        for (let attempt = 1; attempt <= ANALYSIS_API_MAX_ATTEMPTS; attempt++) {
+                            console.log(`🧠 [Worker] Triggering Analysis API for Call ID: ${callId} (attempt ${attempt}/${ANALYSIS_API_MAX_ATTEMPTS})...`);
+                            const analysisResponse = await fetch(analysisUrl, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' }
+                            });
 
-                        if (analysisResponse.ok) {
-                            console.log(`✅ [Worker] Analysis API triggered successfully for ${callId}`);
+                            if (analysisResponse.ok) {
+                                console.log(`✅ [Worker] Analysis API triggered successfully for ${callId}`);
+                                break;
+                            }
+
+                            const errText = await analysisResponse.text();
+                            const notReady =
+                                analysisResponse.status === 404 ||
+                                analysisResponse.status === 503 ||
+                                analysisResponse.status === 502 ||
+                                /not\s*found/i.test(errText);
+
+                            if (notReady && attempt < ANALYSIS_API_MAX_ATTEMPTS) {
+                                console.warn(`⚠️ [Worker] Analysis API not ready for ${callId} (${analysisResponse.status}), retry in ${ANALYSIS_API_RETRY_MS}ms...`);
+                                await new Promise(r => setTimeout(r, ANALYSIS_API_RETRY_MS));
+                                continue;
+                            }
+
+                            console.warn(`⚠️ [Worker] Analysis API failed for ${callId}:`, errText);
                             break;
                         }
-
-                        const errText = await analysisResponse.text();
-                        const notReady =
-                            analysisResponse.status === 404 ||
-                            analysisResponse.status === 503 ||
-                            analysisResponse.status === 502 ||
-                            /not\s*found/i.test(errText);
-
-                        if (notReady && attempt < ANALYSIS_API_MAX_ATTEMPTS) {
-                            console.warn(`⚠️ [Worker] Analysis API not ready for ${callId} (${analysisResponse.status}), retry in ${ANALYSIS_API_RETRY_MS}ms...`);
-                            await new Promise(r => setTimeout(r, ANALYSIS_API_RETRY_MS));
-                            continue;
-                        }
-
-                        console.warn(`⚠️ [Worker] Analysis API failed for ${callId}:`, errText);
-                        break;
+                    } catch (analysisError) {
+                        console.error(`❌ [Worker] Error triggering Analysis API:`, analysisError.message);
                     }
-                } catch (analysisError) {
-                    console.error(`❌ [Worker] Error triggering Analysis API:`, analysisError.message);
                 }
             }
-
         } catch (error) {
             console.error(`❌ [Worker] triggerPostCallActions CRITICAL ERROR:`, error.message);
             await this.logErrorToDb({
