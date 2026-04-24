@@ -577,6 +577,10 @@ export class Scheduler {
         console.log('🚀 [Scheduler] Starting contact scanning loop...');
         const db = await getDb();
 
+        // 0. Global expiry sweep: expire campaigns across non-terminal statuses
+        // when end window has passed and tillCallsComplete !== true.
+        await this.expirePastEndWindowCampaigns(db);
+
         // 0a. Activate immediateStart campaigns once their script is ready
         await this.activateImmediateStartCampaigns(db);
 
@@ -600,6 +604,31 @@ export class Scheduler {
 
         console.log(`🔍 [Scheduler] Found ${activeCampaigns.length} active campaigns.`);
         await this.processCampaignsWithConcurrency(activeCampaigns, db);
+    }
+
+    async expirePastEndWindowCampaigns(db) {
+        const candidates = await db.collection('campaigns').find({
+            status: { $nin: ['expired', 'completed', 'failed'] },
+            archive: { $ne: true },
+            tillCallsComplete: { $ne: true },
+            endDate: { $exists: true, $ne: null }
+        }).toArray();
+
+        if (candidates.length === 0) return;
+
+        let expiredCount = 0;
+        for (const campaign of candidates) {
+            const expired = await this.expireCampaignIfPastEndWindow({
+                campaign,
+                db,
+                context: 'global expiry sweep'
+            });
+            if (expired) expiredCount += 1;
+        }
+
+        if (expiredCount > 0) {
+            console.log(`⌛ [Scheduler] Global expiry sweep marked ${expiredCount} campaign(s) as expired.`);
+        }
     }
 
     async isQueueBackpressured() {
@@ -892,6 +921,7 @@ export class Scheduler {
 
     async expireCampaignIfPastEndWindow({ campaign, db, context = 'scheduler', ignoreEndWindow }) {
         if (!campaign || campaign.tillCallsComplete === true) return false;
+        if (campaign.status === 'draft') return false;
 
         let shouldIgnoreEndWindow = ignoreEndWindow === true;
         if (ignoreEndWindow !== true && campaign.googleSheetsDataId) {
