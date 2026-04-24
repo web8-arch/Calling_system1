@@ -28,6 +28,33 @@ const MONGO_TX_MAX_ATTEMPTS = Math.max(1, parseInt(process.env.MONGO_TX_MAX_ATTE
 const MONGO_TX_RETRY_BASE_MS = Math.max(10, parseInt(process.env.MONGO_TX_RETRY_BASE_MS || '75', 10));
 const MONGO_TX_RETRY_CAP_MS = Math.max(MONGO_TX_RETRY_BASE_MS, parseInt(process.env.MONGO_TX_RETRY_CAP_MS || '1200', 10));
 
+function isHttpsOrLocal(urlStr) {
+    try {
+        const parsed = new URL(urlStr);
+        if (parsed.protocol === 'https:') return true;
+        if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') return true;
+        return false;
+    } catch {
+        return false;
+    }
+}
+
+function enforceSecureUpstream(name, urlStr) {
+    if (!urlStr) return;
+    if (process.env.NODE_ENV !== 'production') return;
+    if (!isHttpsOrLocal(urlStr)) {
+        throw new Error(`[Security] ${name} must be HTTPS in production: ${urlStr}`);
+    }
+}
+
+function validateWorkerJobData(jobData) {
+    if (!jobData || typeof jobData !== 'object') return { ok: false, reason: 'missing_job_data' };
+    if (!jobData.campaignId || !ObjectId.isValid(String(jobData.campaignId))) return { ok: false, reason: 'invalid_campaign_id' };
+    if (!jobData.contactId || !ObjectId.isValid(String(jobData.contactId))) return { ok: false, reason: 'invalid_contact_id' };
+    if (!jobData.userId) return { ok: false, reason: 'missing_user_id' };
+    return { ok: true };
+}
+
 /**
  * Billable duration (seconds) from CallLog events. Prefers call_answered + call_hangup timestamps, then cdr_push.Duration when ANSWER.
  */
@@ -222,6 +249,9 @@ async function shouldIgnoreEndWindow({ campaign, metadata, db }) {
 
 export class CallWorker {
     constructor() {
+        enforceSecureUpstream('CALL_API_BASIC_URL', process.env.CALL_API_BASIC_URL || '');
+        enforceSecureUpstream('CALL_API_PREMIUM_URL', process.env.CALL_API_PREMIUM_URL || '');
+        enforceSecureUpstream('ANALYSIS_API_URL', config.analysis?.apiUrl || '');
         this.postCallQueue = createPostCallQueue();
         this.billingIndexesEnsured = false;
         this.billingHealth = {
@@ -452,6 +482,11 @@ export class CallWorker {
     }
 
     async processJob(job) {
+        const payloadValidation = validateWorkerJobData(job?.data);
+        if (!payloadValidation.ok) {
+            console.warn(`⚠️ [Worker] Dropping malformed job ${job?.id || '(unknown)'}: ${payloadValidation.reason}`);
+            return;
+        }
         const { campaignId, contactId, userId, metadata } = job.data;
         const contactObjId = new ObjectId(contactId);
         const { campaignLimit, userLimit, businessHours } = metadata;
@@ -597,7 +632,12 @@ export class CallWorker {
             }
 
             // 5. Execute API Call
-            const result = await this.executeCall(job.data);
+            const callAttempt = Array.isArray(currentContact.callAttempts) ? currentContact.callAttempts.length + 1 : 1;
+            const result = await this.executeCall({
+                ...job.data,
+                callAttempt,
+                idempotencyKey: `call:${campaignId}:${contactId}:${callAttempt}`
+            });
             attemptStartedAt = Date.now(); // Capture once; used for nextRetryAt and callAttempts timestamp (retry delay from attempt start)
             currentlyHoldingSlot = true; // Still holding the slot from the initiation acquisition
             await heartbeatSlot(true);
@@ -982,6 +1022,8 @@ export class CallWorker {
             campaign_id: data.campaignId,
             contact_id: data.contactId
         };
+        const outboundIdempotencyKey =
+            data.idempotencyKey || `call:${data.campaignId}:${data.contactId}:${data.callAttempt || 1}`;
 
         console.log(`📞 [Worker] Making ${tier} call to ${data.phone || data.contactId} via API (${url})...`);
 
@@ -991,7 +1033,8 @@ export class CallWorker {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'X-API-Key': config.api.callingKey
+                    'X-API-Key': config.api.callingKey,
+                    'X-Idempotency-Key': outboundIdempotencyKey
                 },
                 body: JSON.stringify(payload)
             });
@@ -1011,7 +1054,10 @@ export class CallWorker {
 
         const result = await response.json();
 
-        console.log(`✅ [Worker] API call successful:`, result);
+        console.log(`✅ [Worker] API call successful`, {
+            callId: result?.call?.id || result?.call_id || result?.id || null,
+            status: result?.status || result?.call?.status || null
+        });
         return {
             success: true,
             apiResponse: result,

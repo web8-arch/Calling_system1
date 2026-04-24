@@ -1001,10 +1001,16 @@ export class Scheduler {
             { projection: { phoneNumbers: 1 } }
         );
 
-        // Find the phone number entry that matches this campaign's selected phone
-        // campaign.phoneNumberId or campaign.phoneNumber references the purchased number
-        const campaignPhoneRef = campaign.phoneNumberId || campaign.phoneNumber || campaign.fromNumber;
-        let userConcurrentLimit = 10; // safe default
+        // Find the phone number entry that matches this campaign's selected phone.
+        // Include selectedPhoneNumber because many campaigns persist only that field.
+        const campaignPhoneRef =
+            campaign.phoneNumberId ||
+            campaign.phoneNumber ||
+            campaign.fromNumber ||
+            campaign.selectedPhoneNumber;
+        const campaignConcurrentLimit = Math.max(1, Number(campaign.concurrentCalls) || 1);
+        let userConcurrentLimit = campaignConcurrentLimit;
+        let matchedPhoneLimit = null;
 
         if (campaignUser?.phoneNumbers && Array.isArray(campaignUser.phoneNumbers)) {
             const matchedPhone = campaignUser.phoneNumbers.find(p =>
@@ -1014,17 +1020,21 @@ export class Scheduler {
             );
 
             if (matchedPhone?.concurrentCalls) {
-                userConcurrentLimit = matchedPhone.concurrentCalls;
-                console.log(`📞 [Scheduler] Phone ${matchedPhone.number} has concurrentCalls limit: ${userConcurrentLimit}`);
+                matchedPhoneLimit = Math.max(1, Number(matchedPhone.concurrentCalls) || 1);
+                // Campaign-selected concurrentCalls is primary; phone limit is informational only.
+                userConcurrentLimit = campaignConcurrentLimit;
+                console.log(
+                    `📞 [Scheduler] Campaign concurrency primary: requested=${campaignConcurrentLimit}, phone=${matchedPhone.number}, phoneLimit=${matchedPhoneLimit}, effective=${userConcurrentLimit}`
+                );
             } else {
-                // Fallback: sum all phone concurrentCalls for this user (if no phoneRef on campaign)
-                const totalLimit = campaignUser.phoneNumbers.reduce((sum, p) => sum + (p.concurrentCalls || 0), 0);
-                userConcurrentLimit = totalLimit || campaign.concurrentCalls || 10;
-                console.log(`📞 [Scheduler] No phone match found. Using total/fallback limit: ${userConcurrentLimit}`);
+                userConcurrentLimit = campaignConcurrentLimit;
+                console.log(
+                    `📞 [Scheduler] No phone match found for ref=${campaignPhoneRef || 'n/a'}. Using campaign concurrentCalls=${userConcurrentLimit}`
+                );
             }
         } else {
-            userConcurrentLimit = campaign.concurrentCalls || 10;
-            console.log(`📞 [Scheduler] No phoneNumbers on user. Falling back to campaign limit: ${userConcurrentLimit}`);
+            userConcurrentLimit = campaignConcurrentLimit;
+            console.log(`📞 [Scheduler] No phoneNumbers on user. Using campaign concurrentCalls=${userConcurrentLimit}`);
         }
 
         const now = new Date();
@@ -1067,8 +1077,8 @@ export class Scheduler {
                     phone: contact.mobileNumber || contact.contactData?.Number || contact.phone, // Flexible phone mapping
                     metadata: {
                         businessHours: campaign.callingHours || campaign.businessHours,
-                        campaignLimit: campaign.concurrentCalls || 500,
-                        userLimit: userConcurrentLimit, // ← user's actual purchased limit (cross-campaign total)
+                        campaignLimit: campaignConcurrentLimit,
+                        userLimit: userConcurrentLimit, // campaign-first policy for this campaign
                         maxRetryAttempts: campaign.maxRetryAttempts || 3,
                         retryDelayMinutes: campaign.retryDelayMinutes || 30,
                         voiceTier: campaign.selectedVoice?.tier || 'premium',
