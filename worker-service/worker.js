@@ -1505,27 +1505,6 @@ export class CallWorker {
                             { session, projection: { credits: 1 } }
                         );
 
-                        await creditTxCol.insertOne(
-                            {
-                                userId: user._id,
-                                userEmail: user.email,
-                                type: 'call_deduction',
-                                amount: -cost,
-                                balanceAfter: parseFloat((userAfter?.credits || 0).toFixed(6)),
-                                description: 'Call Usage',
-                                reference: {
-                                    campaignId: campaign._id,
-                                    campaignName: campaign.name || campaign.campaignName,
-                                    callDuration: durationInSeconds,
-                                    callId,
-                                    leadId,
-                                    billingKey,
-                                },
-                                createdAt: new Date(),
-                                updatedAt: new Date()
-                            },
-                            { session }
-                        );
 
                         const today = new Date().toISOString().split('T')[0];
                         await db.collection('analytics').updateOne(
