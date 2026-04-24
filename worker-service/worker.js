@@ -1448,8 +1448,7 @@ export class CallWorker {
                 partialMinuteFraction = (bracket?.percentOfRatePerMinute ?? 100) / 100;
             }
 
-            // const cost = parseFloat(((fullMinutes * totalRatePerMinute) + (partialMinuteFraction * totalRatePerMinute)).toFixed(6));
-            const cost = parseFloat(((fullMinutes * ratePerMinute) + (partialMinuteFraction * ratePerMinute)).toFixed(6));
+            const cost = parseFloat(((fullMinutes * totalRatePerMinute) + (partialMinuteFraction * totalRatePerMinute)).toFixed(6));
             const creditTxCol = db.collection('credittransactions');
             await this.ensureBillingIndexes(db);
 
