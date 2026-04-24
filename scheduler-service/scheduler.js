@@ -577,6 +577,10 @@ export class Scheduler {
         console.log('🚀 [Scheduler] Starting contact scanning loop...');
         const db = await getDb();
 
+        // 0. Global expiry sweep: expire campaigns across non-terminal statuses
+        // when end window has passed and tillCallsComplete !== true.
+        await this.expirePastEndWindowCampaigns(db);
+
         // 0a. Activate immediateStart campaigns once their script is ready
         await this.activateImmediateStartCampaigns(db);
 
@@ -600,6 +604,31 @@ export class Scheduler {
 
         console.log(`🔍 [Scheduler] Found ${activeCampaigns.length} active campaigns.`);
         await this.processCampaignsWithConcurrency(activeCampaigns, db);
+    }
+
+    async expirePastEndWindowCampaigns(db) {
+        const candidates = await db.collection('campaigns').find({
+            status: { $nin: ['expired', 'completed', 'failed'] },
+            archive: { $ne: true },
+            tillCallsComplete: { $ne: true },
+            endDate: { $exists: true, $ne: null }
+        }).toArray();
+
+        if (candidates.length === 0) return;
+
+        let expiredCount = 0;
+        for (const campaign of candidates) {
+            const expired = await this.expireCampaignIfPastEndWindow({
+                campaign,
+                db,
+                context: 'global expiry sweep'
+            });
+            if (expired) expiredCount += 1;
+        }
+
+        if (expiredCount > 0) {
+            console.log(`⌛ [Scheduler] Global expiry sweep marked ${expiredCount} campaign(s) as expired.`);
+        }
     }
 
     async isQueueBackpressured() {
@@ -647,7 +676,7 @@ export class Scheduler {
                 { immediateStart: true },
                 { customizeSchedule: false }
             ],
-            status: { $nin: ['active', 'completed', 'paused', 'failed'] },
+            status: { $nin: ['active', 'completed', 'paused', 'failed', 'expired'] },
             archive: { $ne: true }
         }).toArray();
 
@@ -657,6 +686,10 @@ export class Scheduler {
 
         for (const campaign of pendingCampaigns) {
             const campaignId = campaign._id;
+            const isExpiredByWindow = await this.expireCampaignIfPastEndWindow({ campaign, db, context: 'immediateStart activation' });
+            if (isExpiredByWindow) {
+                continue;
+            }
 
             // Check if the campaign script has been generated yet
             const script = await db.collection('campaign_scripts').findOne({
@@ -741,6 +774,10 @@ export class Scheduler {
             // Skip immediateStart campaigns here as they are handled by activateImmediateStartCampaigns
             const isImmediate = campaign.immediateStart === true || campaign.customizeSchedule === false;
             if (isImmediate) continue;
+            const isExpiredByWindow = await this.expireCampaignIfPastEndWindow({ campaign, db, context: 'scheduled activation' });
+            if (isExpiredByWindow) {
+                continue;
+            }
 
             // 1. Check if the campaign script has been generated yet
             const script = await db.collection('campaign_scripts').findOne({
@@ -844,6 +881,83 @@ export class Scheduler {
         };
     }
 
+    getCampaignEndDateTime(campaign) {
+        if (!campaign?.endDate) return null;
+        const tz = campaign.timezone || 'Asia/Kolkata';
+        let zone = 'Asia/Kolkata';
+        if (typeof tz === 'string') {
+            if (tz.includes('Chennai') || tz.includes('Kolkata') || tz.includes('Mumbai')) {
+                zone = 'Asia/Kolkata';
+            } else {
+                const match = tz.match(/UTC([+-]\d+:\d+)/);
+                zone = match ? `UTC${match[1]}` : tz;
+            }
+        }
+
+        const endDateISO = (campaign.endDate instanceof Date)
+            ? DateTime.fromJSDate(campaign.endDate).toISODate()
+            : (typeof campaign.endDate === 'string' ? (campaign.endDate.match(/^(\d{4}-\d{2}-\d{2})/)?.[1] || null) : null);
+        if (!endDateISO) return null;
+
+        let endDt = DateTime.fromISO(endDateISO, { zone }).endOf('day');
+        if (typeof campaign.endTime === 'string' && campaign.endTime.trim()) {
+            const t = campaign.endTime.trim();
+            const formats = ['HH:mm:ss', 'HH:mm', 'h:mm a', 'h:mm:ss a'];
+            for (const fmt of formats) {
+                const parsed = DateTime.fromFormat(t, fmt, { zone: 'UTC' });
+                if (parsed.isValid) {
+                    endDt = DateTime.fromISO(endDateISO, { zone }).set({
+                        hour: parsed.hour,
+                        minute: parsed.minute,
+                        second: parsed.second,
+                        millisecond: 0
+                    });
+                    break;
+                }
+            }
+        }
+        return endDt.isValid ? endDt : null;
+    }
+
+    async expireCampaignIfPastEndWindow({ campaign, db, context = 'scheduler', ignoreEndWindow }) {
+        if (!campaign || campaign.tillCallsComplete === true) return false;
+        if (campaign.status === 'draft') return false;
+
+        let shouldIgnoreEndWindow = ignoreEndWindow === true;
+        if (ignoreEndWindow !== true && campaign.googleSheetsDataId) {
+            try {
+                const sheetDoc = await db.collection('googlesheetsdatas').findOne({
+                    _id: new ObjectId(campaign.googleSheetsDataId)
+                });
+                shouldIgnoreEndWindow = sheetDoc?.autoSyncEnabled === true;
+            } catch (err) {
+                console.warn(`[Scheduler] Could not fetch GoogleSheetsData for campaign ${campaign._id}:`, err.message);
+            }
+        }
+        if (shouldIgnoreEndWindow) return false;
+
+        const endDt = this.getCampaignEndDateTime(campaign);
+        if (!endDt) return false;
+
+        const now = DateTime.now().setZone(endDt.zoneName);
+        if (now <= endDt) return false;
+
+        const updated = await db.collection('campaigns').updateOne(
+            { _id: campaign._id, status: { $ne: 'expired' } },
+            {
+                $set: {
+                    status: 'expired',
+                    expiredAt: new Date(),
+                    updatedAt: new Date()
+                }
+            }
+        );
+        if (updated.modifiedCount > 0) {
+            console.log(`⌛ [Scheduler] Campaign ${campaign.campaignName} (${campaign._id}) marked expired in ${context}; end window was ${endDt.toISO()}.`);
+        }
+        return true;
+    }
+
     /**
      * Processes a single campaign by scanning pending contacts.
      */
@@ -862,56 +976,15 @@ export class Scheduler {
                 console.warn(`[Scheduler] Could not fetch GoogleSheetsData for campaign ${campaign._id}:`, err.message);
             }
         }
-
-        // End window guard: if endDate/endTime is passed and tillCallsComplete !== true, do not enqueue new calls.
-        let onlyFollowUps = false;
-        try {
-            if (!ignoreEndWindow && campaign?.tillCallsComplete !== true && campaign?.endDate) {
-                const tz = campaign.timezone || 'Asia/Kolkata';
-                let zone = 'Asia/Kolkata';
-                if (typeof tz === 'string') {
-                    if (tz.includes('Chennai') || tz.includes('Kolkata') || tz.includes('Mumbai')) {
-                        zone = 'Asia/Kolkata';
-                    } else {
-                        const match = tz.match(/UTC([+-]\d+:\d+)/);
-                        zone = match ? `UTC${match[1]}` : tz;
-                    }
-                }
-
-                const endDateISO = (campaign.endDate instanceof Date)
-                    ? DateTime.fromJSDate(campaign.endDate).toISODate()
-                    : (typeof campaign.endDate === 'string' ? (campaign.endDate.match(/^(\d{4}-\d{2}-\d{2})/)?.[1] || null) : null);
-
-                if (endDateISO) {
-                    // Default to end-of-day if endTime is missing/unparseable.
-                    let endDt = DateTime.fromISO(endDateISO, { zone }).endOf('day');
-
-                    if (typeof campaign.endTime === 'string' && campaign.endTime.trim()) {
-                        const t = campaign.endTime.trim();
-                        const formats = ['HH:mm:ss', 'HH:mm', 'h:mm a', 'h:mm:ss a'];
-                        for (const fmt of formats) {
-                            const parsed = DateTime.fromFormat(t, fmt, { zone: 'UTC' });
-                            if (parsed.isValid) {
-                                endDt = DateTime.fromISO(endDateISO, { zone }).set({
-                                    hour: parsed.hour,
-                                    minute: parsed.minute,
-                                    second: parsed.second,
-                                    millisecond: 0
-                                });
-                                break;
-                            }
-                        }
-                    }
-
-                    const now = DateTime.now().setZone(endDt.zoneName);
-                    if (endDt.isValid && now > endDt) {
-                        onlyFollowUps = true; // Block regular contacts, let follow-ups through
-                    }
-                }
-            }
-        } catch (e) {
-            // Never block scheduler loop because of end-window parsing issues
-            console.warn(`⚠️ [Scheduler] End window check failed for campaign ${campaign?._id}:`, e.message);
+        // End window guard: if endDate/endTime is passed and tillCallsComplete !== true, mark campaign expired and stop scheduling.
+        const isExpiredByWindow = await this.expireCampaignIfPastEndWindow({
+            campaign,
+            db,
+            context: 'campaign processing',
+            ignoreEndWindow
+        });
+        if (isExpiredByWindow) {
+            return;
         }
 
         if (!isWithinBusinessHours(campaign)) {
@@ -919,7 +992,7 @@ export class Scheduler {
             return;
         }
 
-        console.log(`📡 [Scheduler] Processing campaign: ${campaign.campaignName} (${campaign._id}) ${onlyFollowUps ? '(Follow-ups ONLY)' : ''}`);
+        console.log(`📡 [Scheduler] Processing campaign: ${campaign.campaignName} (${campaign._id})`);
 
         // Fetch the user's purchased concurrent call limit from the DB
         // The limit is stored per-phone-number in user.phoneNumbers[].concurrentCalls
@@ -928,10 +1001,16 @@ export class Scheduler {
             { projection: { phoneNumbers: 1 } }
         );
 
-        // Find the phone number entry that matches this campaign's selected phone
-        // campaign.phoneNumberId or campaign.phoneNumber references the purchased number
-        const campaignPhoneRef = campaign.phoneNumberId || campaign.phoneNumber || campaign.fromNumber;
-        let userConcurrentLimit = 10; // safe default
+        // Find the phone number entry that matches this campaign's selected phone.
+        // Include selectedPhoneNumber because many campaigns persist only that field.
+        const campaignPhoneRef =
+            campaign.phoneNumberId ||
+            campaign.phoneNumber ||
+            campaign.fromNumber ||
+            campaign.selectedPhoneNumber;
+        const campaignConcurrentLimit = Math.max(1, Number(campaign.concurrentCalls) || 1);
+        let userConcurrentLimit = campaignConcurrentLimit;
+        let matchedPhoneLimit = null;
 
         if (campaignUser?.phoneNumbers && Array.isArray(campaignUser.phoneNumbers)) {
             const matchedPhone = campaignUser.phoneNumbers.find(p =>
@@ -941,17 +1020,21 @@ export class Scheduler {
             );
 
             if (matchedPhone?.concurrentCalls) {
-                userConcurrentLimit = matchedPhone.concurrentCalls;
-                console.log(`📞 [Scheduler] Phone ${matchedPhone.number} has concurrentCalls limit: ${userConcurrentLimit}`);
+                matchedPhoneLimit = Math.max(1, Number(matchedPhone.concurrentCalls) || 1);
+                // Campaign-selected concurrentCalls is primary; phone limit is informational only.
+                userConcurrentLimit = campaignConcurrentLimit;
+                console.log(
+                    `📞 [Scheduler] Campaign concurrency primary: requested=${campaignConcurrentLimit}, phone=${matchedPhone.number}, phoneLimit=${matchedPhoneLimit}, effective=${userConcurrentLimit}`
+                );
             } else {
-                // Fallback: sum all phone concurrentCalls for this user (if no phoneRef on campaign)
-                const totalLimit = campaignUser.phoneNumbers.reduce((sum, p) => sum + (p.concurrentCalls || 0), 0);
-                userConcurrentLimit = totalLimit || campaign.concurrentCalls || 10;
-                console.log(`📞 [Scheduler] No phone match found. Using total/fallback limit: ${userConcurrentLimit}`);
+                userConcurrentLimit = campaignConcurrentLimit;
+                console.log(
+                    `📞 [Scheduler] No phone match found for ref=${campaignPhoneRef || 'n/a'}. Using campaign concurrentCalls=${userConcurrentLimit}`
+                );
             }
         } else {
-            userConcurrentLimit = campaign.concurrentCalls || 10;
-            console.log(`📞 [Scheduler] No phoneNumbers on user. Falling back to campaign limit: ${userConcurrentLimit}`);
+            userConcurrentLimit = campaignConcurrentLimit;
+            console.log(`📞 [Scheduler] No phoneNumbers on user. Using campaign concurrentCalls=${userConcurrentLimit}`);
         }
 
         const now = new Date();
@@ -965,11 +1048,6 @@ export class Scheduler {
                 }
             ]
         };
-
-        // If we are past the end date, only pick up explicitly marked follow-up contacts
-        if (onlyFollowUps) {
-            contactQuery.isFollowUp = true;
-        }
 
         const contactCursor = db.collection('contactprocessings').find(contactQuery)
             .project({ _id: 1, phone: 1, mobileNumber: 1, userId: 1, isVip: 1, retryCount: 1, isFollowUp: 1 });
@@ -999,8 +1077,8 @@ export class Scheduler {
                     phone: contact.mobileNumber || contact.contactData?.Number || contact.phone, // Flexible phone mapping
                     metadata: {
                         businessHours: campaign.callingHours || campaign.businessHours,
-                        campaignLimit: campaign.concurrentCalls || 500,
-                        userLimit: userConcurrentLimit, // ← user's actual purchased limit (cross-campaign total)
+                        campaignLimit: campaignConcurrentLimit,
+                        userLimit: userConcurrentLimit, // campaign-first policy for this campaign
                         maxRetryAttempts: campaign.maxRetryAttempts || 3,
                         retryDelayMinutes: campaign.retryDelayMinutes || 30,
                         voiceTier: campaign.selectedVoice?.tier || 'premium',

@@ -18,6 +18,15 @@ if (!process.env.MONGODB_URI && envFile !== '.env') {
     dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 }
 
+if (nodeEnv === 'production') {
+    const required = ['MONGODB_URI', 'CALLING_API_KEY'];
+    for (const key of required) {
+        if (!process.env[key]) {
+            throw new Error(`[Config] Missing required secret: ${key}`);
+        }
+    }
+}
+
 export const config = {
     mongodb: {
         uri: process.env.MONGODB_URI,
