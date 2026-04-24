@@ -108,6 +108,50 @@ function isPastCampaignEnd(campaign) {
     return now > endDt;
 }
 
+const KB_USD_PER_INR = Number.parseFloat(process.env.KB_USD_PER_INR || '0.012');
+
+function roundSix(value) {
+    return Number.parseFloat((value || 0).toFixed(6));
+}
+
+function toFiniteNumber(value) {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function convertInrToUsd(inrValue) {
+    const inr = toFiniteNumber(inrValue);
+    if (inr === null) return 0;
+    return roundSix(inr * KB_USD_PER_INR);
+}
+
+function toObjectIdOrNull(value) {
+    if (!value) return null;
+    try {
+        return new ObjectId(String(value));
+    } catch {
+        return null;
+    }
+}
+
+function extractKnowledgeRefs(campaign) {
+    const refs = new Set();
+    const knowledgeBaseIds = campaign?.selectedKnowledgebases;
+
+    if (Array.isArray(knowledgeBaseIds)) {
+        for (const item of knowledgeBaseIds) {
+            if (!item) continue;
+            if (typeof item === 'string' || typeof item === 'number') {
+                refs.add(String(item));
+                continue;
+            }
+            if (item.fileId) refs.add(String(item.fileId));
+        }
+    }
+
+    return [...refs];
+}
+
 async function shouldIgnoreEndWindow({ campaign, metadata, db }) {
     if (metadata?.ignoreEndWindow === true) return true;
     // Fallback for already-enqueued jobs that don't have metadata.ignoreEndWindow yet:
@@ -206,6 +250,37 @@ export class CallWorker {
             this.postCallWorker.close(),
             this.postCallQueue.close()
         ]);
+    }
+
+    async resolveKbRatePerMinute(db, campaign) {
+        const selectedFileIds = extractKnowledgeRefs(campaign);
+        let docs = [];
+
+        try {
+            if (selectedFileIds.length > 0) {
+                docs = await db.collection('knowledges').find({
+                    'pdfDocuments.fileId': { $in: selectedFileIds }
+                }).toArray();
+            }
+        } catch (error) {
+            console.warn(`⚠️ [Worker] Failed loading knowledges for campaign ${campaign?._id}: ${error.message}`);
+            return 0;
+        }
+
+        let kbRatePerMinute = 0;
+        for (const doc of docs) {
+            const pdfDocuments = Array.isArray(doc?.pdfDocuments) ? doc.pdfDocuments : [];
+            for (const fileDoc of pdfDocuments) {
+                if (!fileDoc?.fileId || !selectedFileIds.includes(String(fileDoc.fileId))) continue;
+                // Strict source: only from knowledges.pdfDocuments.metadata.kbRatePerMinute (stored in INR/min).
+                const direct = toFiniteNumber(fileDoc?.metadata?.kbRatePerMinute);
+                if (direct !== null && direct >= 0) {
+                    kbRatePerMinute += convertInrToUsd(direct);
+                }
+            }
+        }
+
+        return roundSix(kbRatePerMinute);
     }
 
     /**
@@ -931,6 +1006,12 @@ export class CallWorker {
                 ratePerMinute = 0.08;
             }
 
+            const kbRatePerMinute = await this.resolveKbRatePerMinute(db, campaign);
+            const totalRatePerMinute = roundSix(ratePerMinute + kbRatePerMinute);
+            console.log(
+                `💳 [Worker] Billing rates — plan: ${ratePerMinute}/min, kb: ${kbRatePerMinute}/min, total: ${totalRatePerMinute}/min`
+            );
+
             // 3. Billing Brackets and Cost Calculation
             const durationInSeconds = duration; // Already in seconds from logic above
 
@@ -957,7 +1038,7 @@ export class CallWorker {
                 partialMinuteFraction = (bracket?.percentOfRatePerMinute ?? 100) / 100;
             }
 
-            const cost = parseFloat(((fullMinutes * ratePerMinute) + (partialMinuteFraction * ratePerMinute)).toFixed(6));
+            const cost = parseFloat(((fullMinutes * totalRatePerMinute) + (partialMinuteFraction * totalRatePerMinute)).toFixed(6));
 
             // 4. Atomic Credit Deduction
             if (user.credits < cost) {
@@ -1006,7 +1087,10 @@ export class CallWorker {
                     campaignName: campaign.name || campaign.campaignName,
                     callDuration: durationInSeconds,
                     callId: callId,
-                    leadId: leadId
+                    leadId: leadId,
+                    planRatePerMinute: roundSix(ratePerMinute),
+                    kbRatePerMinute,
+                    totalRatePerMinute
                 },
                 createdAt: new Date(),
                 updatedAt: new Date()
@@ -1039,6 +1123,9 @@ export class CallWorker {
                         $set: {
                             creditsDeducted: true,
                             creditsDeductedAmount: cost,
+                            planRatePerMinute: roundSix(ratePerMinute),
+                            kbRatePerMinute,
+                            totalRatePerMinute,
                             updatedAt: new Date()
                         }
                     }
