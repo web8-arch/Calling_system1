@@ -108,7 +108,7 @@ function isPastCampaignEnd(campaign) {
     return now > endDt;
 }
 
-const KB_USD_PER_INR = Number.parseFloat(process.env.KB_USD_PER_INR || '0.012');
+const KB_USD_PER_INR = Number.parseFloat(process.env.KB_USD_PER_INR || String(1 / 94));
 
 function roundSix(value) {
     return Number.parseFloat((value || 0).toFixed(6));
